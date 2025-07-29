@@ -4,8 +4,8 @@
 
   <groupId>io.github.byzatic</groupId>
   <artifactId>java-byzatic-commons</artifactId>
-  <version>0.0.1-SNAPSHOT</version>
-<!--  <version>0.0.1</version>-->
+  <version>0.0.2</version>
+  <!--<version>0.0.2-SNAPSHOT</version>-->
   <packaging>jar</packaging>
 
   <name>JavaByzaticCommons</name>
@@ -65,14 +65,16 @@
     <project.java.version>1.8</project.java.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-    <version.slf4j>1.7.25</version.slf4j>
-    <version.logback>1.2.9</version.logback>
-    <version.junit>4.13.1</version.junit>
+    <version.slf4j>1.7.36</version.slf4j>
+    <version.logback>1.5.18</version.logback>
+    <version.junit>4.13.2</version.junit>
+    <version.jetbrains_annotations>21.0.1</version.jetbrains_annotations>
   </properties>
 
   <!-- manual set -->
   <dependencies>
 
+    <!-- https://mvnrepository.com/artifact/junit/junit -->
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
@@ -80,30 +82,34 @@
       <scope>test</scope>
     </dependency>
 
+    <!-- https://mvnrepository.com/artifact/org.slf4j/slf4j-api -->
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
       <version>${version.slf4j}</version>
     </dependency>
 
+    <!-- https://mvnrepository.com/artifact/ch.qos.logback/logback-core -->
     <dependency>
       <groupId>ch.qos.logback</groupId>
       <artifactId>logback-core</artifactId>
       <version>${version.logback}</version>
-      <!--      <scope>test</scope>-->
+      <scope>test</scope>
     </dependency>
 
+    <!-- https://mvnrepository.com/artifact/ch.qos.logback/logback-classic -->
     <dependency>
       <groupId>ch.qos.logback</groupId>
       <artifactId>logback-classic</artifactId>
       <version>${version.logback}</version>
-      <!--      <scope>test</scope>-->
+      <scope>test</scope>
     </dependency>
 
+    <!-- https://mvnrepository.com/artifact/org.jetbrains/annotations -->
     <dependency>
       <groupId>org.jetbrains</groupId>
       <artifactId>annotations</artifactId>
-      <version>21.0.1</version>
+      <version>${version.jetbrains_annotations}</version>
     </dependency>
   </dependencies>
 
@@ -112,6 +118,8 @@
     <plugins>
 
       <!-- GPG -->
+      <!-- Signs the artifacts with a GPG key during the install phase to ensure authenticity and integrity,
+      required for deployment to Maven Central. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-gpg-plugin</artifactId>
@@ -128,6 +136,8 @@
       </plugin>
 
       <!-- Source JAR -->
+      <!-- Generates a source JAR containing the project’s .java files and attaches it to the build
+      during the verify phase. This is also required for publication to Maven Central. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-source-plugin</artifactId>
@@ -137,7 +147,7 @@
             <id>attach-sources</id>
             <phase>verify</phase>
             <goals>
-<!--              <goal>jar-no-fork</goal>-->
+              <!--<goal>jar-no-fork</goal>-->
               <goal>jar</goal>
             </goals>
           </execution>
@@ -145,6 +155,8 @@
       </plugin>
 
       <!-- Javadoc JAR -->
+      <!-- Generates a Javadoc JAR and attaches it to the build during the verify phase.
+      This is necessary for Maven Central publication. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-javadoc-plugin</artifactId>
@@ -160,6 +172,8 @@
         </executions>
       </plugin>
 
+      <!-- Compiles the Java source -->
+      <!-- Compiles the Java source code using the specified source and target versions and character encoding. -->
       <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
@@ -170,7 +184,10 @@
               <encoding>${project.build.sourceEncoding}</encoding>
           </configuration>
       </plugin>
-      
+
+      <!-- Maven clean -->
+      <!-- Deletes additional custom directories (logs/ and reports/) during the
+      clean phase to keep the workspace tidy. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-clean-plugin</artifactId>
@@ -195,6 +212,9 @@
         </configuration>
       </plugin>
 
+      <!-- Copies dependencies -->
+      <!-- Copies all runtime dependencies into the target/lib directory during the package phase,
+      which is useful for assembling distribution packages. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
@@ -213,6 +233,8 @@
         </executions>
       </plugin>
 
+      <!-- Runs unit tests -->
+      <!-- Runs unit tests during the test phase using JUnit (including JUnit 4.7+ via surefire-junit47).-->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
@@ -226,6 +248,9 @@
         </dependencies>
       </plugin>
 
+      <!-- Runs integration tests-->
+      <!-- Runs integration tests during the integration-test and verify phases,
+      typically used for post-build verification.-->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
@@ -246,6 +271,9 @@
         </executions>
       </plugin>
 
+      <!-- Automates publishing to Maven Central-->
+      <!-- Automates the process of publishing artifacts to Maven Central via Sonatype OSSRH,
+      handling signing, staging, and releasing.-->
       <plugin>
         <groupId>org.sonatype.central</groupId>
         <artifactId>central-publishing-maven-plugin</artifactId>
@@ -253,8 +281,8 @@
         <extensions>true</extensions>
         <configuration>
           <publishingServerId>central</publishingServerId>
-<!--          <autoPublish>true</autoPublish>-->
-<!--          <waitUntil>published</waitUntil>-->
+          <!--<autoPublish>true</autoPublish>-->
+          <!--<waitUntil>published</waitUntil>-->
         </configuration>
       </plugin>
 
