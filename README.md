@@ -5,7 +5,7 @@ JavaByzaticCommons is a lightweight Java library that provides a set of reusable
 ## Maven
 
 Artifact available on Maven Central:  
-https://central.sonatype.com/artifact/io.github.byzatic/java-byzatic-commons/overview
+https://central.sonatype.com/artifact/io.github.byzatic/java-byzatic-commons
 
 ```xml
 <dependency>
@@ -97,7 +97,7 @@ Path path = temp.getPath();
 
 ---
 
-### CustomConverter
+### CustomConverter by [Konstantin Fedorov (SoulHunt3r)](https://github.com/SoulHunt3r)
 
 A generic utility for converting objects from one class to another using reflection. It supports mapping fields by name or by a custom `@Reflectable` annotation.
 
