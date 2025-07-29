@@ -97,6 +97,33 @@ Path path = temp.getPath();
 
 ---
 
+### CustomConverter
+
+A generic utility for converting objects from one class to another using reflection. It supports mapping fields by name or by a custom `@Reflectable` annotation.
+
+#### Features:
+- Recursively copies matching fields from source to destination.
+- Supports lists and nested object conversion.
+- Enum-to-enum conversion based on `name()`.
+- Handles different types by recursively invoking conversion logic.
+
+#### Annotation Support:
+You can annotate fields with `@Reflectable(name = "customName")` to map fields between source and destination with different names.
+
+#### Exceptions:
+- Throws `DataConvertException` on reflection or instantiation errors.
+
+#### Example:
+```java
+Destination dest = CustomConverter.parse(source, Destination.class);
+```
+
+#### Notes:
+- Source and destination classes must have a no-argument constructor.
+- For collections, element types must also be convertible.
+
+---
+
 ## Requirements
 
 - Java 8 or higher

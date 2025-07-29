@@ -4,7 +4,7 @@
 
   <groupId>io.github.byzatic</groupId>
   <artifactId>java-byzatic-commons</artifactId>
-  <version>0.0.2</version>
+  <version>0.0.3</version>
   <!--<version>0.0.2-SNAPSHOT</version>-->
   <packaging>jar</packaging>
 
@@ -81,6 +81,15 @@
       <version>${version.junit}</version>
       <scope>test</scope>
     </dependency>
+
+    <!-- https://mvnrepository.com/artifact/org.junit.jupiter/junit-jupiter-engine -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-engine</artifactId>
+      <version>5.7.1</version>
+      <scope>test</scope>
+    </dependency>
+
 
     <!-- https://mvnrepository.com/artifact/org.slf4j/slf4j-api -->
     <dependency>
