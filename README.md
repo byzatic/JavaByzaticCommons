@@ -1,6 +1,6 @@
 # JavaByzaticCommons
 
-JavaByzaticCommons is a lightweight Java library that provides a set of reusable utilities for common development needs, including JDBC URL parsing, object validation, temporary directory handling, and custom exceptions for partial failures.
+JavaByzaticCommons is a lightweight utility toolkit for JVM projects, offering small, focused modules including an Apache Commons VFS–based recursive directory watcher (with debouncing and rate limiting), JDBC URL parsing, validation helpers, temporary directory utilities, and an OperationIncompleteException for partial-failure workflows.
 
 ## Maven
 
@@ -11,7 +11,7 @@ https://central.sonatype.com/artifact/io.github.byzatic/java-byzatic-commons
 <dependency>
     <groupId>io.github.byzatic</groupId>
     <artifactId>java-byzatic-commons</artifactId>
-    <version>0.0.3</version>
+    <version>0.0.4</version>
 </dependency>
 ```
 
@@ -122,11 +122,102 @@ Destination dest = CustomConverter.parse(source, Destination.class);
 - Source and destination classes must have a no-argument constructor.
 - For collections, element types must also be convertible.
 
+## RecursiveVfsDirectoryWatcher
+
+A lightweight, polling-based, **recursive** directory watcher built on Apache Commons VFS. It detects **file** events (`CREATED`, `MODIFIED`, `DELETED`) under a root directory (local or remote via VFS), with optional **rate limiting** and **debouncing** so you can tame event storms.
+
+> Callbacks run on a single dedicated dispatcher thread. Keep handlers fast and non-blocking.
+
+### Quick Start
+
+```java
+RecursiveVfsDirectoryWatcher watcher =
+    new RecursiveVfsDirectoryWatcher.Builder()
+        // Choose one:
+        .rootPath(Paths.get("/var/data"))              // local path convenience
+        // .rootPath("/var/data")                      // local path (string)
+        // .rootUri("file:///var/data")                // explicit VFS URI
+        // .rootUri("sftp://user@host:22/inbox/")      // remote via VFS (requires provider on classpath)
+        .listener(new DirectoryChangeListener() {
+            @Override public void onFileCreated(Path p)  { /* handle */ }
+            @Override public void onFileModified(Path p) { /* handle */ }
+            @Override public void onFileDeleted(Path p)  { /* handle */ }
+            @Override public void onAny(Path p)          { /* auditing/metrics */ }
+        })
+        .pollingIntervalMillis(500)                     // faster reaction in tests/dev
+        .globalDebounceWindowMillis(200)                // coalesce bursts per path
+        .matcherDebounceWindow("glob:**/*.tmp", 2000)   // noisy tmp files: hold off
+        .globalRateLimitPerSecond(200)                  // bound total throughput
+        .matcherRateLimit("glob:**/*.log", 5)           // at most 5 events/sec for *.log
+        .excludePath(Paths.get("/var/data/cache"))      // skip heavy subtree
+        .shutdownHookEnabled(true)
+        .build();
+
+watcher.start();
+// ...
+watcher.close(); // or use watcher.stopWatching() for legacy API
+```
+
+### Typical Use‑Cases
+
+- **Hot‑reload configuration**: watch `conf/` for new or changed YAML/JSON; debounce to avoid reload on partial writes.
+- **Data dropbox ingestion** (local or SFTP): trigger pipeline when new files land; rate‑limit or debounce to prevent thundering herds.
+- **Log shipping / metrics**: watch directories for rolling logs; treat rapid rotations with debounce; avoid overloading with rate limits.
+- **Selective monitoring**: exclude `cache/` or `tmp/` subtrees; apply glob‑specific rules (e.g., separate policies for `**/*.csv` vs `**/*.tmp`).
+
+### Event Semantics
+
+- Detects file events by comparing `(size, lastModified)` snapshot per path between polling iterations.
+- Emits **one `onAny(path)` per logical event** (after the specific callback).
+- Directories are **not** reported as events; only files are tracked.
+- First scan runs **immediately** on `start()`; subsequent scans run every `pollingIntervalMillis`.
+
+### Builder Options (Parameters & Examples)
+
+> Unless stated otherwise, values are optional and have sensible defaults. Options can be freely combined.
+
+| Option | Type / Default | What it does | Example |
+|---|---|---|---|
+| `fsManager` | `FileSystemManager` / `null` | Supply a custom VFS manager (e.g., with extra providers). If `null`, uses `VFS.getManager()`. | `.fsManager(customManager)` |
+| `rootUri` | `String` / **required** (unless using `rootPath(...)`) | Root as VFS URI. Must exist and be a directory. | `.rootUri("file:///var/data")`, `.rootUri("sftp://user@host/inbox")` |
+| `rootPath(Path)` | `Path` | Convenience for local filesystem roots; converted to `file://` URI. | `.rootPath(Paths.get("/var/data"))` |
+| `rootPath(String)` | `String` | Convenience for local filesystem roots; converted to `file://` URI. | `.rootPath("/var/data")` |
+| `listener` | `DirectoryChangeListener` / **required** | Receives callbacks: `onFileCreated`, `onFileModified`, `onFileDeleted`, `onAny`. | `.listener(myListener)` |
+| `pollingIntervalMillis` | `long` / `1000` | Period between scans. Lower values = faster detection, higher CPU/IO. | `.pollingIntervalMillis(250)` |
+| `maxQueueSize` | `int` / `4096` | Bounded internal event queue size. When full, new events are dropped. | `.maxQueueSize(10_000)` |
+| `excludePath` | `Path` | Exclude subtree(s) from scanning and events. Prefix match (`path.startsWith(excluded)`). | `.excludePath(Paths.get("/var/data/cache"))` |
+| `globalRateLimitPerSecond` | `double` / `0` (off) | Global token bucket across **all** events. | `.globalRateLimitPerSecond(200)` |
+| `perPathRateLimit` | `Path, double` | Rate limit for a specific path. | `.perPathRateLimit(Paths.get("/var/data/inbox/file.csv"), 1.0)` |
+| `matcherRateLimit` | `String, double` | Rate limit by path pattern. The first arg must include the syntax prefix, typically `glob:`. | `.matcherRateLimit("glob:**/*.log", 5.0)` |
+| `globalDebounceWindowMillis` | `long` / `0` (off) | Minimum silence between events **for the same path**. Drops events that arrive within the window. | `.globalDebounceWindowMillis(300)` |
+| `perPathDebounceWindow` | `Path, long` | Debounce for a specific path. | `.perPathDebounceWindow(Paths.get("/var/data/inbox/big.csv"), 2_000)` |
+| `matcherDebounceWindow` | `String, long` | Debounce by pattern (`glob:` or `regex:`). | `.matcherDebounceWindow("glob:**/*.tmp", 2_000)` |
+| `shutdownHookEnabled` | `boolean` / `true` | If `true`, installs a JVM shutdown hook that calls `close()`. | `.shutdownHookEnabled(false)` |
+
+**Notes on patterns:** For `matcherRateLimit` and `matcherDebounceWindow`, pass the full syntax, e.g. `"glob:**/*.csv"` or `"regex:.*\\.csv"`. Patterns are evaluated with `FileSystems.getDefault().getPathMatcher(...)` against the watcher's `Path` representation.
+
+### Threading & Performance
+
+- One daemon thread performs polling; one daemon thread dispatches callbacks.
+- Avoid blocking in callbacks; offload heavy work to your executor.
+- On large trees, prefer higher `pollingIntervalMillis`, exclude heavy subtrees, and enable debounce/rate‑limits.
+
+### Backward Compatibility
+
+- `startWatching()` and `stopWatching()` are available as aliases for `start()` and `close()`.
+- `rootPath(...)` overloads complement `rootUri(...)` to ease local usage.
+
+### Limitations
+
+- Polling can miss very short‑lived create/delete between scans; adjust interval and debounce to your needs.
+- Change detection is based on `(size, lastModified)`; exotic filesystems that do not update these might not be tracked accurately.
+- Pattern matching uses the default JVM `FileSystem` semantics, which may differ from remote VFS providers' native path rules.
+
 ---
 
 ## Requirements
 
-- Java 8 or higher
+- Java 17 or higher
 
 ## License
 
