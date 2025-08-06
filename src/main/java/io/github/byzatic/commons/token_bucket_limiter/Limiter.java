@@ -8,7 +8,7 @@ package io.github.byzatic.commons.token_bucket_limiter;
  * returns immediately. Implementations should be thread-safe unless
  * explicitly stated otherwise.
  *
- * <h3>Semantics</h3>
+ * <h2>Semantics</h2>
  * <ul>
  *   <li>Non-blocking: never sleeps or waits.</li>
  *   <li>Unary: each call is for exactly one permit.</li>

@@ -446,8 +446,7 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
 
         /**
          * Pattern-based rate limit. The syntax must include "glob:" or "regex:".
-         * Example: matcherRateLimit("glob:
-         **//*.log", 5.0)
+         * Example: matcherRateLimit("glob: **&#47;*.log", 5.0)
          */
         public Builder matcherRateLimit(String syntaxAndPattern, double permitsPerSecond) {
             if (permitsPerSecond <= 0) throw new IllegalArgumentException("permitsPerSecond must be > 0");

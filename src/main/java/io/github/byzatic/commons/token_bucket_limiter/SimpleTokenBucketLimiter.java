@@ -7,7 +7,7 @@ package io.github.byzatic.commons.token_bucket_limiter;
  * {@code max(1, ratePerSecond)} tokens (bucket capacity). Uses {@code System.nanoTime()}
  * for time measurement and a floating-point token counter for smooth refill.
  *
- * <h3>Algorithm</h3>
+ * <h2>Algorithm</h2>
  * <ul>
  *   <li>On each {@link #tryAcquire()} call, computes the elapsed time since the previous call
  *       and refills the internal token counter by {@code elapsedSeconds * ratePerSecond},
@@ -16,7 +16,7 @@ package io.github.byzatic.commons.token_bucket_limiter;
  *       otherwise returns {@code false} immediately.</li>
  * </ul>
  *
- * <h3>Burst behavior</h3>
+ * <h2>Burst behavior</h2>
  * <ul>
  *   <li>Bucket capacity (burst) defaults to {@code max(1, ratePerSecond)}:
  *     <ul>
@@ -28,17 +28,17 @@ package io.github.byzatic.commons.token_bucket_limiter;
  *   <li>If you need a different bucket size, add an alternative constructor with a {@code burstCapacity} parameter.</li>
  * </ul>
  *
- * <h3>Thread-safety</h3>
+ * <h2>Thread-safety</h2>
  * <ul>
  *   <li>Methods are thread-safe; internal state is guarded by synchronization.</li>
  * </ul>
  *
- * <h3>Complexity</h3>
+ * <h2>Complexity</h2>
  * <ul>
  *   <li>O(1) per call, with no allocations on the hot path.</li>
  * </ul>
  *
- * <h3>Example</h3>
+ * <h2>Example</h2>
  * <pre>{@code
  * Limiter limiter = new SimpleTokenBucketLimiter(5.0); // ~5 permits/sec, burst ~5
  * if (limiter.tryAcquire()) {
@@ -48,11 +48,11 @@ package io.github.byzatic.commons.token_bucket_limiter;
  * }
  * }</pre>
  *
- * <h3>Typical placements</h3>
+ * <h2>Typical placements</h2>
  * <ul>
  *   <li>Global limit: cap the total flow of all events.</li>
  *   <li>Per-path: tame particularly noisy files/paths.</li>
- *   <li>Pattern-based (via PathMatcher): e.g., for all {@code **//*.log} files.</li>
+ *   <li>Pattern-based (via PathMatcher): e.g., for all {@code **&#47;*.log} files.</li>
  * </ul>
 */
 public final class SimpleTokenBucketLimiter implements Limiter {
