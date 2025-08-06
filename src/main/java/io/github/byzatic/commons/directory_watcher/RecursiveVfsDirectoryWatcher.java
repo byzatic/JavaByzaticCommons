@@ -1,7 +1,5 @@
 package io.github.byzatic.commons.directory_watcher;
 
-import com.google.common.annotations.Beta;
-import com.google.errorprone.annotations.ThreadSafe;
 import io.github.byzatic.commons.token_bucket_limiter.Limiter;
 import io.github.byzatic.commons.token_bucket_limiter.SimpleTokenBucketLimiter;
 import org.apache.commons.vfs2.FileObject;
@@ -29,8 +27,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * - Supports debounce windows globally, per-path, and by path matcher.
  * - Directories are not reported as events; only files are tracked.
  */
-@Beta
-@ThreadSafe
 public class RecursiveVfsDirectoryWatcher implements Closeable {
     private final static Logger logger = LoggerFactory.getLogger(RecursiveVfsDirectoryWatcher.class);
 
