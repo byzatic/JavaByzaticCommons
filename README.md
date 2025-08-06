@@ -215,6 +215,37 @@ watcher.close(); // or use watcher.stopWatching() for legacy API
 
 ---
 
+## Token-bucket limiter (Limiter, SimpleTokenBucketLimiter)
+
+A tiny, non-blocking rate-limiting module:
+- `Limiter` — `boolean tryAcquire()` contract.
+- `SimpleTokenBucketLimiter` — thread-safe token bucket:
+    - rate: `ratePerSecond`,
+    - burst capacity: `max(1, ratePerSecond)`,
+    - O(1) per call, no external deps.
+
+**Standalone example:**
+```java
+Limiter apiLimiter = new SimpleTokenBucketLimiter(20.0); // ~20 rps
+if (apiLimiter.tryAcquire()) {
+    callExternalApi();
+} else {
+    // skip or reschedule
+}
+```
+
+**With the watcher:**
+```java
+new RecursiveVfsDirectoryWatcher.Builder()
+    .rootPath(Paths.get("/data"))
+    .listener(new DirectoryChangeListener() { /* ... */ })
+    .matcherRateLimit("glob:**/*.csv", 2.0)
+    .perPathRateLimit(Paths.get("/data/inbox/heavy.csv"), 0.2)
+    .build();
+```
+
+---
+
 ## Requirements
 
 - Java 17 or higher

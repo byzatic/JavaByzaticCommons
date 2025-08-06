@@ -1,7 +1,15 @@
 package io.github.byzatic.commons.directory_watcher;
 
-import com.google.common.util.concurrent.RateLimiter;
-import org.apache.commons.vfs2.*;
+import com.google.common.annotations.Beta;
+import com.google.errorprone.annotations.ThreadSafe;
+import io.github.byzatic.commons.token_bucket_limiter.Limiter;
+import io.github.byzatic.commons.token_bucket_limiter.SimpleTokenBucketLimiter;
+import org.apache.commons.vfs2.FileObject;
+import org.apache.commons.vfs2.FileSystemException;
+import org.apache.commons.vfs2.FileSystemManager;
+import org.apache.commons.vfs2.VFS;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -13,15 +21,20 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * A simple polling-based recursive watcher implemented using Apache Commons VFS.
- * It detects CREATED/MODIFIED/DELETED events for files under the given root.
- *
+ * A polling-based recursive watcher implemented on Apache Commons VFS.
+ * Detects CREATED/MODIFIED/DELETED events for files under the given root.
  * Notes:
- *  - This is a polling scanner, not OS inotify/KQueue. Set a sensible polling interval.
- *  - Supports global rate limiting, per-path rate limiting, and glob-based rate limiting.
- *  - Supports debounce windows globally, per-path, and by glob matcher.
+ * - This is a polling scanner (not OS inotify/KQueue). Choose a sensible polling interval.
+ * - Supports global/per-path/pattern-based rate limiting (built-in token bucket, no Guava).
+ * - Supports debounce windows globally, per-path, and by path matcher.
+ * - Directories are not reported as events; only files are tracked.
  */
+@Beta
+@ThreadSafe
 public class RecursiveVfsDirectoryWatcher implements Closeable {
+    private final static Logger logger = LoggerFactory.getLogger(RecursiveVfsDirectoryWatcher.class);
+
+    /* ============== Fields ============== */
 
     private final FileSystemManager fsManager;
     private final FileObject rootDir;
@@ -36,10 +49,10 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
 
     private final Map<Path, FileInfo> knownFiles = new ConcurrentHashMap<>();
 
-    private final RateLimiter globalRateLimiter; // may be null
+    private final Limiter globalRateLimiter; // may be null
     private final double rateLimitPerSecond;
-    private final Map<Path, RateLimiter> rateLimiterPerPath;
-    private final List<Map.Entry<PathMatcher, RateLimiter>> rateLimiterMatchers;
+    private final Map<Path, Limiter> rateLimiterPerPath;
+    private final List<Map.Entry<PathMatcher, Limiter>> rateLimiterMatchers;
 
     private final long debounceWindowMillis;
     private final Map<Path, Long> lastEventTime = new ConcurrentHashMap<>();
@@ -50,25 +63,31 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
     private final boolean shutdownHookEnabled;
     private Thread shutdownHookThread;
 
+    private static final FileObject[] EMPTY = new FileObject[0];
+
+    /* ============ Constructor ============ */
+
     private RecursiveVfsDirectoryWatcher(Builder b) throws FileSystemException {
-        this.fsManager = b.fsManager != null ? b.fsManager : VFS.getManager();
+        this.fsManager = (b.fsManager != null) ? b.fsManager : VFS.getManager();
         this.rootDir = this.fsManager.resolveFile(Objects.requireNonNull(b.rootUri, "rootUri"));
         if (!rootDir.exists() || !rootDir.isFolder()) {
             throw new FileSystemException("Root URI must exist and be a directory: " + b.rootUri);
         }
-
-        this.excludedPaths = Collections.unmodifiableSet(new HashSet<>(b.excludedPaths));
+        this.excludedPaths = Set.copyOf(b.excludedPaths);
         this.listener = Objects.requireNonNull(b.listener, "listener");
         this.pollingIntervalMillis = b.pollingIntervalMillis;
         this.maxQueueSize = b.maxQueueSize;
         this.eventQueue = new ArrayBlockingQueue<>(this.maxQueueSize);
+
         this.rateLimitPerSecond = b.rateLimitPerSecond;
-        this.globalRateLimiter = (rateLimitPerSecond > 0) ? RateLimiter.create(rateLimitPerSecond) : null;
-        this.rateLimiterPerPath = Collections.unmodifiableMap(new HashMap<>(b.rateLimiterPerPath));
-        this.rateLimiterMatchers = Collections.unmodifiableList(new ArrayList<>(b.rateLimiterMatchers));
+        this.globalRateLimiter = (rateLimitPerSecond > 0) ? new SimpleTokenBucketLimiter(rateLimitPerSecond) : null;
+        this.rateLimiterPerPath = Map.copyOf(b.rateLimiterPerPath);
+        this.rateLimiterMatchers = List.copyOf(b.rateLimiterMatchers);
+
         this.debounceWindowMillis = b.debounceWindowMillis;
-        this.debounceWindowPerPath = Collections.unmodifiableMap(new HashMap<>(b.debounceWindowPerPath));
-        this.debounceWindowMatchers = Collections.unmodifiableList(new ArrayList<>(b.debounceWindowMatchers));
+        this.debounceWindowPerPath = Map.copyOf(b.debounceWindowPerPath);
+        this.debounceWindowMatchers = List.copyOf(b.debounceWindowMatchers);
+
         this.shutdownHookEnabled = b.shutdownHookEnabled;
 
         this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -82,11 +101,15 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
             return t;
         });
 
-        // Preload known files snapshot
+        // preload snapshot of known files
         primeKnownFiles();
     }
 
-    /** Start polling. No-op if already running. */
+    /* ============ Lifecycle ============ */
+
+    /**
+     * Start polling. No-op if already running.
+     */
     public void start() {
         if (!running.compareAndSet(false, true)) return;
 
@@ -98,18 +121,38 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
         // Event dispatcher
         eventDispatcher.submit(this::dispatchLoop);
 
-        // Polling task
+        // Polling task — first run immediately (initial delay = 0)
         executor.scheduleAtFixedRate(() -> {
             try {
                 scanOnce();
             } catch (Exception e) {
-                // Don't stop on failure
-                e.printStackTrace();
+                // keep running on failure
+                logger.error("Exception occurred, keep running on failure", e);
             }
         }, 0, pollingIntervalMillis, TimeUnit.MILLISECONDS);
     }
 
-    /** Stop polling and shutdown executors. */
+    /**
+     * Backward-compatibility alias.
+     */
+    public void startWatching() {
+        start();
+    }
+
+    /**
+     * Backward-compatibility alias.
+     */
+    public void stopWatching() {
+        try {
+            close();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Stop polling and shutdown executors.
+     */
     @Override
     public void close() throws IOException {
         if (!running.compareAndSet(true, false)) return;
@@ -131,6 +174,8 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
         }
     }
 
+    /* ============ Internals ============ */
+
     private void dispatchLoop() {
         while (running.get() || !eventQueue.isEmpty()) {
             try {
@@ -148,7 +193,7 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
                         listener.onFileDeleted(ev.getPath());
                         break;
                     case ANY:
-                        // no dedicated callback
+                        // no explicit ANY event enqueued; kept for compatibility
                         break;
                 }
                 listener.onAny(ev.getPath());
@@ -156,8 +201,8 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Throwable t) {
-                // Listener exceptions are swallowed to keep the loop alive
-                t.printStackTrace();
+                // swallow listener exceptions to keep loop alive
+                logger.error("Exception occurred, swallow listener exceptions to keep loop alive", t);
             }
         }
     }
@@ -184,7 +229,7 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
     }
 
     private void scanOnce() throws FileSystemException {
-        // Track which known files we saw this round
+        // Set of files seen in this round
         Set<Path> seen = new HashSet<>();
 
         Deque<FileObject> stack = new ArrayDeque<>();
@@ -205,7 +250,10 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
 
                 FileInfo current;
                 try {
-                    try { fo.refresh(); } catch (FileSystemException ignore) {}
+                    try {
+                        fo.refresh();
+                    } catch (FileSystemException ignore) {
+                    }
                     current = FileInfo.from(fo);
                 } catch (FileSystemException ex) {
                     // Can't read -> skip this file in this cycle
@@ -231,14 +279,15 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
         }
     }
 
-    private static final FileObject[] EMPTY = new FileObject[0];
-
     private FileObject[] safeChildren(FileObject dir) {
         try {
             if (dir.exists() && dir.isFolder()) {
-                try { dir.refresh(); } catch (FileSystemException ignore) {}
+                try {
+                    dir.refresh();
+                } catch (FileSystemException ignore) {
+                }
                 FileObject[] kids = dir.getChildren();
-                return kids != null ? kids : EMPTY;
+                return (kids != null) ? kids : EMPTY;
             }
         } catch (FileSystemException ignore) {
         }
@@ -257,7 +306,7 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
     private void queue(FileEvent event) {
         final Path p = event.getPath();
 
-        // Debounce check
+        // Debounce check (per-path)
         long now = System.currentTimeMillis();
         long window = resolveDebounceWindow(p);
         Long last = lastEventTime.get(p);
@@ -268,7 +317,7 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
 
         // Rate limit check
         if (globalRateLimiter != null && !globalRateLimiter.tryAcquire()) return;
-        RateLimiter rl = resolveRateLimiter(p);
+        Limiter rl = resolveRateLimiter(p);
         if (rl != null && !rl.tryAcquire()) return;
 
         // Enqueue (drop if full to avoid blocking)
@@ -284,39 +333,24 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
         return debounceWindowMillis;
     }
 
-    private RateLimiter resolveRateLimiter(Path p) {
-        RateLimiter r = rateLimiterPerPath.get(p);
+    private Limiter resolveRateLimiter(Path p) {
+        Limiter r = rateLimiterPerPath.get(p);
         if (r != null) return r;
-        for (Map.Entry<PathMatcher, RateLimiter> e : rateLimiterMatchers) {
+        for (Map.Entry<PathMatcher, Limiter> e : rateLimiterMatchers) {
             if (e.getKey().matches(p)) return e.getValue();
         }
         return null;
     }
 
     private Path toLocalPath(FileObject fo) {
-        // Use VFS path; for "file" scheme this is an absolute POSIX/Windows path.
+        // For "file" scheme this is an absolute path; for others it's used as identifier.
         String p = fo.getName().getPath();
         return java.nio.file.Paths.get(p);
     }
 
-    // ===== Builder =====
+    /* ============ Builder ============ */
+
     public static class Builder {
-
-        /** Backward-compatibility: set root by local filesystem Path. */
-        public Builder rootPath(java.nio.file.Path path) {
-            Objects.requireNonNull(path, "path");
-            this.rootUri = path.toUri().toString();
-            return this;
-        }
-
-        /** Backward-compatibility: set root by string path; will be treated as local file path. */
-        public Builder rootPath(String path) {
-            Objects.requireNonNull(path, "path");
-            java.nio.file.Path p = java.nio.file.Paths.get(path);
-            this.rootUri = p.toUri().toString();
-            return this;
-        }
-
         private FileSystemManager fsManager;
         private String rootUri;
         private DirectoryChangeListener listener;
@@ -327,8 +361,8 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
         private long debounceWindowMillis = 0L;  // disabled by default
 
         private final Set<Path> excludedPaths = new HashSet<>();
-        private final Map<Path, RateLimiter> rateLimiterPerPath = new HashMap<>();
-        private final List<Map.Entry<PathMatcher, RateLimiter>> rateLimiterMatchers = new ArrayList<>();
+        private final Map<Path, Limiter> rateLimiterPerPath = new HashMap<>();
+        private final List<Map.Entry<PathMatcher, Limiter>> rateLimiterMatchers = new ArrayList<>();
         private final Map<Path, Long> debounceWindowPerPath = new HashMap<>();
         private final List<Map.Entry<PathMatcher, Long>> debounceWindowMatchers = new ArrayList<>();
 
@@ -344,6 +378,25 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
          */
         public Builder rootUri(String rootUri) {
             this.rootUri = rootUri;
+            return this;
+        }
+
+        /**
+         * Convenience: set root by local filesystem Path (converted to file:// URI).
+         */
+        public Builder rootPath(java.nio.file.Path path) {
+            Objects.requireNonNull(path, "path");
+            this.rootUri = path.toUri().toString();
+            return this;
+        }
+
+        /**
+         * Convenience: set root by local filesystem path string (converted to file:// URI).
+         */
+        public Builder rootPath(String path) {
+            Objects.requireNonNull(path, "path");
+            java.nio.file.Path p = java.nio.file.Paths.get(path);
+            this.rootUri = p.toUri().toString();
             return this;
         }
 
@@ -364,40 +417,57 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
             return this;
         }
 
+        /**
+         * Exclude a subtree from scanning/events. Prefix match via Path.startsWith().
+         */
         public Builder excludePath(Path path) {
             if (path != null) this.excludedPaths.add(path);
             return this;
         }
 
+        /**
+         * Global rate limit (permits per second) across all events; 0 disables limiting.
+         */
         public Builder globalRateLimitPerSecond(double permitsPerSecond) {
             if (permitsPerSecond < 0) throw new IllegalArgumentException("permitsPerSecond must be >= 0");
             this.rateLimitPerSecond = permitsPerSecond;
             return this;
         }
 
+        /**
+         * Per-path rate limit (permits per second).
+         */
         public Builder perPathRateLimit(Path path, double permitsPerSecond) {
             if (path == null) throw new IllegalArgumentException("path is null");
             if (permitsPerSecond <= 0) throw new IllegalArgumentException("permitsPerSecond must be > 0");
-            this.rateLimiterPerPath.put(path, RateLimiter.create(permitsPerSecond));
+            this.rateLimiterPerPath.put(path, new SimpleTokenBucketLimiter(permitsPerSecond));
             return this;
         }
 
-//        /**
-//         * Add a glob-based rate limiter. Example pattern: "glob:**/*.log"
-//                */
+        /**
+         * Pattern-based rate limit. The syntax must include "glob:" or "regex:".
+         * Example: matcherRateLimit("glob:
+         **//*.log", 5.0)
+         */
         public Builder matcherRateLimit(String syntaxAndPattern, double permitsPerSecond) {
             if (permitsPerSecond <= 0) throw new IllegalArgumentException("permitsPerSecond must be > 0");
             PathMatcher pm = FileSystems.getDefault().getPathMatcher(syntaxAndPattern);
-            this.rateLimiterMatchers.add(new AbstractMap.SimpleImmutableEntry<>(pm, RateLimiter.create(permitsPerSecond)));
+            this.rateLimiterMatchers.add(new AbstractMap.SimpleImmutableEntry<>(pm, new SimpleTokenBucketLimiter(permitsPerSecond)));
             return this;
         }
 
+        /**
+         * Global debounce window (ms). 0 disables debouncing.
+         */
         public Builder globalDebounceWindowMillis(long millis) {
             if (millis < 0) throw new IllegalArgumentException("millis must be >= 0");
             this.debounceWindowMillis = millis;
             return this;
         }
 
+        /**
+         * Per-path debounce window (ms).
+         */
         public Builder perPathDebounceWindow(Path path, long millis) {
             if (path == null) throw new IllegalArgumentException("path is null");
             if (millis < 0) throw new IllegalArgumentException("millis must be >= 0");
@@ -405,9 +475,11 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
             return this;
         }
 
-//        /**
-//         * Add a glob-based debounce window. Example pattern: "glob:**/*.tmp"
-//                */
+        /**
+         * Pattern-based debounce window (ms). Syntax must include "glob:" or "regex:".
+         * Example: matcherDebounceWindow("glob:
+         **//*.tmp", 2000)
+         */
         public Builder matcherDebounceWindow(String syntaxAndPattern, long millis) {
             if (millis < 0) throw new IllegalArgumentException("millis must be >= 0");
             PathMatcher pm = FileSystems.getDefault().getPathMatcher(syntaxAndPattern);
@@ -415,6 +487,9 @@ public class RecursiveVfsDirectoryWatcher implements Closeable {
             return this;
         }
 
+        /**
+         * Install JVM shutdown hook that calls close(). Enabled by default.
+         */
         public Builder shutdownHookEnabled(boolean enabled) {
             this.shutdownHookEnabled = enabled;
             return this;

@@ -74,10 +74,11 @@
   <!-- manual set -->
   <dependencies>
 
+    <!-- https://mvnrepository.com/artifact/com.google.guava/guava -->
     <dependency>
       <groupId>com.google.guava</groupId>
       <artifactId>guava</artifactId>
-      <version>33.1.0-jre</version> <!-- Or the latest stable version -->
+      <version>33.4.8-jre</version>
     </dependency>
 
     <!-- https://mvnrepository.com/artifact/org.apache.commons/commons-vfs2 -->
