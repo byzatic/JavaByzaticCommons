@@ -11,7 +11,7 @@ https://central.sonatype.com/artifact/io.github.byzatic/java-byzatic-commons
 <dependency>
     <groupId>io.github.byzatic</groupId>
     <artifactId>java-byzatic-commons</artifactId>
-    <version>0.0.4</version>
+    <version>0.0.5</version>
 </dependency>
 ```
 
