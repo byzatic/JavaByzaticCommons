@@ -4,7 +4,7 @@
 
   <groupId>io.github.byzatic</groupId>
   <artifactId>java-byzatic-commons</artifactId>
-  <version>0.0.3</version>
+  <version>0.0.4</version>
   <!--<version>0.0.2-SNAPSHOT</version>-->
   <packaging>jar</packaging>
 
@@ -62,10 +62,10 @@
   </repositories>
 
   <properties>
-    <project.java.version>1.8</project.java.version>
+    <project.java.version>17</project.java.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-    <version.slf4j>1.7.36</version.slf4j>
+    <version.slf4j>2.0.17</version.slf4j>
     <version.logback>1.5.18</version.logback>
     <version.junit>4.13.2</version.junit>
     <version.jetbrains_annotations>21.0.1</version.jetbrains_annotations>
@@ -73,6 +73,20 @@
 
   <!-- manual set -->
   <dependencies>
+
+    <!-- https://mvnrepository.com/artifact/com.google.guava/guava -->
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>33.4.8-jre</version>
+    </dependency>
+
+    <!-- https://mvnrepository.com/artifact/org.apache.commons/commons-vfs2 -->
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-vfs2</artifactId>
+      <version>2.10.0</version>
+    </dependency>
 
     <!-- https://mvnrepository.com/artifact/junit/junit -->
     <dependency>
