@@ -1,7 +1,8 @@
-package io.github.byzatic.commons.schedulers.cron_job_scheduler.job;
+package io.github.byzatic.commons.schedulers.cron_job_scheduler;
 
-import io.github.byzatic.commons.schedulers.cron_job_scheduler.proxy.StatusProxy;
-import io.github.byzatic.commons.schedulers.cron_job_scheduler.common.CronDateCalculator;
+import io.github.byzatic.commons.UuidProvider;
+import io.github.byzatic.commons.schedulers.TaskTaskStateControlObserver;
+import io.github.byzatic.commons.schedulers.interfaces.CJSJobDetailInterface;
 import org.jetbrains.annotations.NotNull;
 
 import java.text.ParseException;
@@ -12,17 +13,17 @@ import java.util.UUID;
 public class CJSJobDetail implements CJSJobDetailInterface {
     private String uniqueId;
     private Runnable job;
-    private CronDateCalculator calculator;
-    private StatusProxy statusProxy;
+    private CommonCronDateCalculator calculator;
+    private TaskTaskStateControlObserver taskStateControlObserver;
 
     public CJSJobDetail() {
     }
 
     private CJSJobDetail(Builder builder) {
-        uniqueId = builder.uniqueId;
         job = builder.job;
+        uniqueId = builder.uniqueId;
         calculator = builder.calculator;
-        statusProxy = builder.statusProxy;
+        taskStateControlObserver = builder.taskStateControlObserver;
     }
 
     public static Builder newBuilder() {
@@ -34,7 +35,7 @@ public class CJSJobDetail implements CJSJobDetailInterface {
         builder.uniqueId = copy.uniqueId;
         builder.job = copy.job;
         builder.calculator = copy.calculator;
-        builder.statusProxy = copy.statusProxy;
+        builder.taskStateControlObserver = copy.taskStateControlObserver;
         return builder;
     }
 
@@ -55,8 +56,8 @@ public class CJSJobDetail implements CJSJobDetailInterface {
     }
 
     @Override
-    public @NotNull StatusProxy getStatusProxy() {
-        return statusProxy;
+    public @NotNull TaskTaskStateControlObserver getStatusProxy() {
+        return taskStateControlObserver;
     }
 
     @Override
@@ -78,7 +79,7 @@ public class CJSJobDetail implements CJSJobDetailInterface {
                 "uniqueId='" + uniqueId + '\'' +
                 ", job=" + job +
                 ", calculator=" + calculator +
-                ", statusProxy=" + statusProxy +
+                ", statusProxy=" + taskStateControlObserver +
                 '}';
     }
 
@@ -88,8 +89,8 @@ public class CJSJobDetail implements CJSJobDetailInterface {
     public static final class Builder {
         private String uniqueId = UUID.randomUUID().toString();
         private Runnable job;
-        private CronDateCalculator calculator;
-        private StatusProxy statusProxy = new StatusProxy(uniqueId);
+        private CommonCronDateCalculator calculator;
+        private TaskTaskStateControlObserver taskStateControlObserver = new TaskTaskStateControlObserver(uniqueId);
 
         private Builder() {
         }
@@ -101,7 +102,11 @@ public class CJSJobDetail implements CJSJobDetailInterface {
          * @return a reference to this Builder
          */
         public Builder setUniqueId(String uniqueId) {
-            this.uniqueId = uniqueId;
+            if (uniqueId == null) {
+                this.uniqueId = UuidProvider.generateUuidString();
+            } else {
+                this.uniqueId = uniqueId;
+            }
             return this;
         }
 
@@ -123,18 +128,18 @@ public class CJSJobDetail implements CJSJobDetailInterface {
          * @return a reference to this Builder
          */
         public Builder setCronExpressionString(String cronExpressionString) throws ParseException {
-            this.calculator = new CronDateCalculator(cronExpressionString);
+            this.calculator = new CommonCronDateCalculator(cronExpressionString);
             return this;
         }
 
         /**
          * Sets the {@code statusProxy} and returns a reference to this Builder so that the methods can be chained together.
          *
-         * @param statusProxy the {@code statusProxy} to set
+         * @param taskStateControlObserver the {@code statusProxy} to set
          * @return a reference to this Builder
          */
-        public Builder setStatusProxy(StatusProxy statusProxy) {
-            this.statusProxy = statusProxy;
+        public Builder setStatusProxy(TaskTaskStateControlObserver taskStateControlObserver) {
+            this.taskStateControlObserver = taskStateControlObserver;
             return this;
         }
 

@@ -2,22 +2,12 @@ package io.github.byzatic.commons.schedulers;
 
 import org.jetbrains.annotations.NotNull;
 
-import java.util.List;
-
 public interface SchedulerInterface {
-    void addJob(@NotNull JobDetailInterface jobDetailInterface);
+    @NotNull String addJob(@NotNull Task task);
 
-    void runAllJobs(@NotNull Boolean isJoinThreads);
+    void removeJob(@NotNull String taskId);
 
-    void removeAllJobs(@NotNull Long defaultForcedTerminationIntervalMinutes);
-
-    void removeJob(@NotNull JobDetailInterface jobDetailInterface, @NotNull Long defaultForcedTerminationIntervalMinutes);
+    void observer(@NotNull SchedulerObserverInterface schedulerObserver);
 
     void cleanup();
-
-    @NotNull
-    Boolean isJobActive(@NotNull JobDetailInterface jobDetailInterface);
-
-    @NotNull
-    List<JobDetailInterface> listJobDetails();
 }

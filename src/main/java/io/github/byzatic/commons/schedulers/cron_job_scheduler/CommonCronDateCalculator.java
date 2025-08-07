@@ -1,4 +1,4 @@
-package io.github.byzatic.commons.schedulers.cron_job_scheduler.common;
+package io.github.byzatic.commons.schedulers.cron_job_scheduler;
 
 import org.quartz.CronExpression;
 
@@ -30,12 +30,12 @@ import java.util.List;
  *         }
  */
 
-public class CronDateCalculator {
+public class CommonCronDateCalculator {
 
     private final CronExpression cronExpression;
 
     // Конструктор, принимающий cron-выражение
-    public CronDateCalculator(String cronExpressionString) throws ParseException {
+    public CommonCronDateCalculator(String cronExpressionString) throws ParseException {
         this.cronExpression = new CronExpression(cronExpressionString);
     }
 
