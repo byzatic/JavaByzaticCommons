@@ -1,0 +1,6 @@
+org.apache.commons.lang3.NotImplementedException
+support.OperationIncompleteException
+support.OperationTimedOutException
+IllegalArgumentException
+IllegalStateException
+NullPointerException
