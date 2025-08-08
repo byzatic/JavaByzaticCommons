@@ -251,6 +251,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     private void submitRun(JobRecord rec) {
+        // защита от overlap
         if (rec.disallowOverlap && !rec.isRunning.compareAndSet(false, true)) {
             return;
         }
@@ -264,6 +265,14 @@ public final class CronScheduler implements CronSchedulerInterface {
             fire(l -> l.onStart(rec.id));
             try {
                 rec.task.run(token);
+
+                // Если во время ожидания grace уже был выставлен TIMEOUT,
+                // ничего не перетираем и не шлём вторичных событий.
+                if (rec.state == JobState.TIMEOUT) {
+                    rec.lastEnd = Instant.now();
+                    return;
+                }
+
                 boolean cancelled = token.isStopRequested();
                 rec.state = cancelled ? JobState.CANCELLED : JobState.COMPLETED;
                 rec.lastEnd = Instant.now();
@@ -272,20 +281,37 @@ public final class CronScheduler implements CronSchedulerInterface {
                 } else {
                     fire(l -> l.onComplete(rec.id));
                 }
+
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
-                rec.state = JobState.CANCELLED;
-                rec.lastEnd = Instant.now();
-                fire(l -> l.onCancelled(rec.id));
+                if (rec.state != JobState.TIMEOUT) {
+                    rec.state = JobState.CANCELLED;
+                    rec.lastEnd = Instant.now();
+                    fire(l -> l.onCancelled(rec.id));
+                } else {
+                    rec.lastEnd = Instant.now(); // фиксируем конец при TIMEOUT
+                }
+
             } catch (CancellationException ce) {
-                rec.state = JobState.CANCELLED;
-                rec.lastEnd = Instant.now();
-                fire(l -> l.onCancelled(rec.id));
+                if (rec.state != JobState.TIMEOUT) {
+                    rec.state = JobState.CANCELLED;
+                    rec.lastEnd = Instant.now();
+                    fire(l -> l.onCancelled(rec.id));
+                } else {
+                    rec.lastEnd = Instant.now();
+                }
+
             } catch (Throwable ex) {
-                rec.state = JobState.FAILED;
-                rec.lastEnd = Instant.now();
-                rec.lastError = String.valueOf(ex);
-                fire(l -> l.onError(rec.id, ex));
+                // Ошибка важнее обычной отмены, но если уже TIMEOUT — оставляем TIMEOUT
+                if (rec.state != JobState.TIMEOUT) {
+                    rec.state = JobState.FAILED;
+                    rec.lastEnd = Instant.now();
+                    rec.lastError = String.valueOf(ex);
+                    fire(l -> l.onError(rec.id, ex));
+                } else {
+                    rec.lastEnd = Instant.now();
+                }
+
             } finally {
                 rec.runningFuture = null;
                 rec.tokenRef.set(null);
@@ -314,25 +340,26 @@ public final class CronScheduler implements CronSchedulerInterface {
         CancellationToken token = rec.tokenRef.get();
 
         if (f != null && !f.isDone()) {
-            try {
-                rec.task.onStopRequested();
-            } catch (Throwable ignored) {
-            }
+            try { rec.task.onStopRequested(); } catch (Throwable ignored) {}
             if (token != null) token.requestStop(reason);
 
             try {
                 f.get(Math.max(1, grace.toMillis()), TimeUnit.MILLISECONDS);
-                // ВАЖНО: событий тут не шлём — это делает раннер.
+                // Успели завершиться кооперативно: событие и финальный статус выставляет submitRun().
                 if (markRemovedIfDone) rec.state = JobState.CANCELLED;
+
             } catch (TimeoutException te) {
-                f.cancel(true);
+                // Единственная точка, где выставляем TIMEOUT и шлём onTimeout.
+                f.cancel(true); // interrupt
                 rec.state = JobState.TIMEOUT;
                 fire(l -> l.onTimeout(rec.id));
+
             } catch (ExecutionException ee) {
                 rec.state = JobState.FAILED;
                 rec.lastEnd = Instant.now();
                 rec.lastError = String.valueOf(ee.getCause());
                 fire(l -> l.onError(rec.id, ee.getCause()));
+
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 rec.state = JobState.CANCELLED;
@@ -341,7 +368,7 @@ public final class CronScheduler implements CronSchedulerInterface {
         } else {
             // задача не бежит
             if (markRemovedIfDone) rec.state = JobState.CANCELLED;
-            // событий тоже не шлём: нечего отменять — запуска не было
+            // событий не шлём: нечего отменять — запуска не было
         }
     }
 

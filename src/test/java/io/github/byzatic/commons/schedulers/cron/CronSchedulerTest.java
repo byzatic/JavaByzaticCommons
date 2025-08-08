@@ -156,4 +156,146 @@ class CronSchedulerTest {
         // Проверяем, что параллелизма не было
         assertEquals(1, maxConcurrent.get(), "При disallowOverlap не должно быть параллельных запусков");
     }
+
+    // добавь в CronSchedulerTest
+
+    @Test
+    void timeoutDoesNotFlipToCancelled_andNoDuplicateEvents() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch timedOut = new CountDownLatch(1);
+        CountDownLatch cancelled = new CountDownLatch(1);
+        AtomicInteger timeoutEvents = new AtomicInteger(0);
+
+        scheduler = new CronScheduler.Builder()
+                .addListener(new JobEventListener() {
+                    @Override public void onStart(UUID jobId) { started.countDown(); }
+                    @Override public void onTimeout(UUID jobId) {
+                        timeoutEvents.incrementAndGet();
+                        timedOut.countDown();
+                    }
+                    @Override public void onCancelled(UUID jobId) { cancelled.countDown(); }
+                })
+                .defaultGrace(Duration.ofMillis(50))
+                .build();
+
+        UUID id = scheduler.addJob("*/1 * * * * *", token -> {
+            // игнорируем токен, чтобы гарантированно уйти в timeout -> interrupt
+            try { Thread.sleep(5_000); } catch (InterruptedException ignored) {}
+        }, /*disallowOverlap*/ true, /*runImmediately*/ true);
+
+        assertTrue(started.await(1, TimeUnit.SECONDS));
+        scheduler.stopJob(id, Duration.ofMillis(50));
+
+        assertTrue(timedOut.await(2, TimeUnit.SECONDS), "onTimeout не пришёл");
+        // небольшая пауза, чтобы раннер успел завершиться после interrupt
+        Thread.sleep(100);
+
+        assertEquals(JobState.TIMEOUT, scheduler.query(id).get().state, "Статус не должен перезаписаться на CANCELLED");
+        assertEquals(1, timeoutEvents.get(), "onTimeout должен быть единожды");
+        assertEquals(0, cancelled.getCount(), "После timeout не должен прилетать onCancelled");
+    }
+
+    @Test
+    void removeJob_removesFromRegistry_queryBecomesEmpty() throws Exception {
+        scheduler = new CronScheduler.Builder().build();
+        UUID id = scheduler.addJob("*/1 * * * * *", token -> { /* быстрый таск */ }, true, true);
+        // дать задаче стартануть/закончить
+        Thread.sleep(100);
+
+        assertTrue(scheduler.removeJob(id));
+        assertTrue(scheduler.query(id).isEmpty(), "После remove запись должна пропасть из реестра");
+        // повторное удаление — false
+        assertFalse(scheduler.removeJob(id));
+    }
+
+    @Test
+    void stopJob_afterCompleted_doesNotChangeFinalState() throws Exception {
+        CountDownLatch completed = new CountDownLatch(1);
+
+        scheduler = new CronScheduler.Builder()
+                .addListener(new JobEventListener() {
+                    @Override public void onComplete(UUID jobId) { completed.countDown(); }
+                })
+                .build();
+
+        UUID id = scheduler.addJob("*/1 * * * * *", token -> Thread.sleep(50), true, true);
+        assertTrue(completed.await(2, TimeUnit.SECONDS), "Не дождались завершения задачи");
+
+        // уже завершено — стоп не должен менять статус
+        scheduler.stopJob(id, Duration.ofMillis(50));
+        assertEquals(JobState.COMPLETED, scheduler.query(id).get().state, "Стоп после завершения не должен менять статус");
+    }
+
+    @Test
+    void errorInTask_setsFailed_andOnErrorFires() throws Exception {
+        CountDownLatch errored = new CountDownLatch(1);
+
+        scheduler = new CronScheduler.Builder()
+                .addListener(new JobEventListener() {
+                    @Override public void onError(UUID jobId, Throwable error) { errored.countDown(); }
+                })
+                .build();
+
+        UUID id = scheduler.addJob("*/1 * * * * *", token -> { throw new IllegalStateException("boom"); }, true, true);
+
+        assertTrue(errored.await(2, TimeUnit.SECONDS), "onError не пришёл");
+        assertEquals(JobState.FAILED, scheduler.query(id).get().state);
+        assertNotNull(scheduler.query(id).get().lastError);
+    }
+
+    @Test
+    void stopJob_twice_afterTimeout_isIdempotent_andKeepsTimeoutState() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        AtomicInteger timeoutEvents = new AtomicInteger(0);
+
+        scheduler = new CronScheduler.Builder()
+                .addListener(new JobEventListener() {
+                    @Override public void onStart(UUID jobId) { started.countDown(); }
+                    @Override public void onTimeout(UUID jobId) { timeoutEvents.incrementAndGet(); }
+                })
+                .defaultGrace(Duration.ofMillis(50))
+                .build();
+
+        UUID id = scheduler.addJob("*/1 * * * * *", token -> {
+            try { Thread.sleep(5_000); } catch (InterruptedException ignored) {}
+        }, true, true);
+
+        assertTrue(started.await(1, TimeUnit.SECONDS));
+        scheduler.stopJob(id, Duration.ofMillis(50));
+
+        // подождать, пока выставится TIMEOUT
+        Thread.sleep(150);
+        assertEquals(JobState.TIMEOUT, scheduler.query(id).get().state);
+
+        // повторный стоп не должен слать лишние события и менять статус
+        scheduler.stopJob(id, Duration.ofMillis(50));
+        Thread.sleep(100);
+
+        assertEquals(JobState.TIMEOUT, scheduler.query(id).get().state);
+        assertEquals(1, timeoutEvents.get(), "Повторный stop не должен дублировать onTimeout");
+    }
+
+    @Test
+    void allowOverlap_allowsParallelRuns() throws Exception {
+        // позволяем наложения: длительная задача 1.5с, cron каждую секунду → должен быть параллелизм >= 2
+        AtomicInteger concurrent = new AtomicInteger(0);
+        AtomicInteger maxConcurrent = new AtomicInteger(0);
+        CountDownLatch seenParallel = new CountDownLatch(1);
+
+        scheduler = new CronScheduler.Builder().build();
+
+        scheduler.addJob("*/1 * * * * *", token -> {
+            int now = concurrent.incrementAndGet();
+            maxConcurrent.accumulateAndGet(now, Math::max);
+            try {
+                Thread.sleep(1500);
+            } finally {
+                concurrent.decrementAndGet();
+                if (maxConcurrent.get() >= 2) seenParallel.countDown();
+            }
+        }, /*disallowOverlap*/ false, /*runImmediately*/ true);
+
+        assertTrue(seenParallel.await(5, TimeUnit.SECONDS), "Не увидели параллельного выполнения при allowOverlap");
+        assertTrue(maxConcurrent.get() >= 2, "Должно быть >=2 параллельных запусков при allowOverlap=false");
+    }
 }
