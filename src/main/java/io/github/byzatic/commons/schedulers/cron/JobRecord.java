@@ -23,8 +23,7 @@ final class JobRecord {
     final AtomicBoolean removed = new AtomicBoolean(false);
     final AtomicBoolean isRunning = new AtomicBoolean(false); // защита от overlap
     final boolean disallowOverlap;
-
-    volatile boolean timeoutGuard = false; // interrupt пришёл из-за timeout
+    final AtomicBoolean terminalEventSent = new AtomicBoolean(false);
     final AtomicBoolean timedOut = new AtomicBoolean(false);
 
     JobRecord(UUID id, CronExpr cron, CronTask task, ZoneId zone, boolean disallowOverlap) {

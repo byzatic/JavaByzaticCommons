@@ -157,10 +157,14 @@ class CronSchedulerTest {
         assertEquals(1, maxConcurrent.get(), "При disallowOverlap не должно быть параллельных запусков");
     }
 
-    // добавь в CronSchedulerTest
-
+    //    Воспроизводится гонка: вы запускаете cron */1 * * * * * с runImmediately=true.
+    //После stopJob(..., 50ms) requestStop() выставляет TIMEOUT и шлёт onTimeout,
+    // но очень быстро (до 1 секунды) приходит следующий тик, submitRun() запускает новый прогон и тут же ставит state=RUNNING.
+    // Вы успеваете увидеть уже второй прогон, отсюда Actual: RUNNING.
     @Test
     void timeoutDoesNotFlipToCancelled_andNoDuplicateEvents() throws Exception {
+        String veryRareCron = "0 0 0 1 1 0"; // НГ в вск 00:00 — следующий тик очень нескоро
+
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch timedOut = new CountDownLatch(1);
         CountDownLatch cancelled = new CountDownLatch(1);
@@ -169,17 +173,13 @@ class CronSchedulerTest {
         scheduler = new CronScheduler.Builder()
                 .addListener(new JobEventListener() {
                     @Override public void onStart(UUID jobId) { started.countDown(); }
-                    @Override public void onTimeout(UUID jobId) {
-                        timeoutEvents.incrementAndGet();
-                        timedOut.countDown();
-                    }
+                    @Override public void onTimeout(UUID jobId) { timeoutEvents.incrementAndGet(); timedOut.countDown(); }
                     @Override public void onCancelled(UUID jobId) { cancelled.countDown(); }
                 })
                 .defaultGrace(Duration.ofMillis(50))
                 .build();
 
-        UUID id = scheduler.addJob("*/1 * * * * *", token -> {
-            // игнорируем токен, чтобы гарантированно уйти в timeout -> interrupt
+        UUID id = scheduler.addJob(veryRareCron, token -> {
             try { Thread.sleep(5_000); } catch (InterruptedException ignored) {}
         }, /*disallowOverlap*/ true, /*runImmediately*/ true);
 
@@ -187,12 +187,19 @@ class CronSchedulerTest {
         scheduler.stopJob(id, Duration.ofMillis(50));
 
         assertTrue(timedOut.await(2, TimeUnit.SECONDS), "onTimeout не пришёл");
-        // небольшая пауза, чтобы раннер успел завершиться после interrupt
-        Thread.sleep(100);
 
-        assertEquals(JobState.TIMEOUT, scheduler.query(id).get().state, "Статус не должен перезаписаться на CANCELLED");
+        // Дождаться, что раннер вышел из RUNNING (финализировался после interrupt)
+        long deadline = System.currentTimeMillis() + 500;
+        JobState state;
+        do {
+            state = scheduler.query(id).get().state;
+            if (state != JobState.RUNNING) break;
+            Thread.sleep(10);
+        } while (System.currentTimeMillis() < deadline);
+
+        assertEquals(JobState.TIMEOUT, state, "Статус не должен перезаписаться на CANCELLED");
         assertEquals(1, timeoutEvents.get(), "onTimeout должен быть единожды");
-        assertEquals(0, cancelled.getCount(), "После timeout не должен прилетать onCancelled");
+        assertFalse(cancelled.await(200, TimeUnit.MILLISECONDS), "После timeout не должен прилетать onCancelled");
     }
 
     @Test
