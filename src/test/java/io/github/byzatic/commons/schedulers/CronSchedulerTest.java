@@ -73,4 +73,70 @@ class CronSchedulerTest {
         assertTrue(cancelledEvent.await(3, TimeUnit.SECONDS));
         assertEquals(JobState.CANCELLED, scheduler.query(id).get().state);
     }
+
+    @Test
+    void runImmediately_true_startsRightAway_evenIfCronIsFar() throws Exception {
+        // берём крон, который явно не должен сработать скоро (НГ в полночь воскресенье)
+        String veryRareCron = "0 0 0 1 1 0";
+
+        CountDownLatch started = new CountDownLatch(1);
+
+        scheduler = new CronScheduler.Builder().build();
+        scheduler.addListener(new JobEventListener() {
+            @Override public void onStart(UUID jobId) { started.countDown(); }
+        });
+
+        // ВАЖНО: runImmediately = true
+        scheduler.addJob(veryRareCron, token -> {}, /*disallowOverlap*/ true, /*runImmediately*/ true);
+
+        // Должно стартовать почти сразу
+        assertTrue(started.await(1, TimeUnit.SECONDS), "Первый запуск не стартовал сразу при runImmediately=true");
+    }
+
+    @Test
+    void runImmediately_false_doesNotStartRightAway_whenCronIsFar() throws Exception {
+        String veryRareCron = "0 0 0 1 1 0";
+
+        CountDownLatch started = new CountDownLatch(1);
+
+        scheduler = new CronScheduler.Builder().build();
+        scheduler.addListener(new JobEventListener() {
+            @Override public void onStart(UUID jobId) { started.countDown(); }
+        });
+
+        // ВАЖНО: runImmediately = false
+        scheduler.addJob(veryRareCron, token -> {}, /*disallowOverlap*/ true, /*runImmediately*/ false);
+
+        // В ближайшую секунду старта быть не должно
+        assertFalse(started.await(1, TimeUnit.SECONDS), "Запуск не должен происходить сразу при runImmediately=false");
+    }
+
+    @Test
+    void runImmediately_respectsDisallowOverlap_withNextCronTick() throws Exception {
+        // частый cron, чтобы следующий тик пришёл быстро
+        String everySecond = "*/1 * * * * *";
+
+        AtomicInteger concurrent = new AtomicInteger(0);
+        AtomicInteger maxConcurrent = new AtomicInteger(0);
+        CountDownLatch finishedOnce = new CountDownLatch(1);
+
+        scheduler = new CronScheduler.Builder().build();
+
+        // runImmediately = true, задача > 1с, чтобы «накрылся» следующий тик
+        scheduler.addJob(everySecond, token -> {
+            int now = concurrent.incrementAndGet();
+            maxConcurrent.accumulateAndGet(now, Math::max);
+            try {
+                Thread.sleep(1200); // дольше секунды — следующий тик точно придёт
+            } finally {
+                concurrent.decrementAndGet();
+                finishedOnce.countDown();
+            }
+        }, /*disallowOverlap*/ true, /*runImmediately*/ true);
+
+        // Ждём завершения первого запуска
+        assertTrue(finishedOnce.await(3, TimeUnit.SECONDS), "Первый запуск не завершился вовремя");
+        // Проверяем, что параллелизма не было
+        assertEquals(1, maxConcurrent.get(), "При disallowOverlap не должно быть параллельных запусков");
+    }
 }

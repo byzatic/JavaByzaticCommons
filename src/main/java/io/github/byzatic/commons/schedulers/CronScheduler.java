@@ -109,11 +109,33 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     /**
+     * Добавить задачу по cron и (опционально) стартовать её сразу.
+     */
+    @Override
+    public UUID addJob(String cron, CronTask task, boolean disallowOverlap, boolean runImmediately) {
+        Objects.requireNonNull(cron);
+        Objects.requireNonNull(task);
+        CronExpr expr = CronExpr.parse(cron);
+        UUID id = UUID.randomUUID();
+        JobRecord rec = new JobRecord(id, expr, task, zone, disallowOverlap);
+        jobs.put(id, rec);
+
+        long firstTrigger = runImmediately
+                ? System.currentTimeMillis()                       // запустить немедленно
+                : expr.next(Instant.now(), zone)                   // как раньше: ближайший по cron
+                .orElseThrow(() -> new IllegalArgumentException("Cron has no future fire time: " + cron))
+                .toEpochMilli();
+
+        queue.offer(new ScheduledEntry(id, firstTrigger));
+        return id;
+    }
+
+    /**
      * Добавить задачу по cron. Возвращает UUID джобы.
      */
     @Override
     public UUID addJob(String cron, CronTask task) {
-        return addJob(cron, task, false);
+        return addJob(cron, task, false, true);    // без overlap, НО старт сразу
     }
 
     /**
@@ -121,17 +143,7 @@ public final class CronScheduler implements CronSchedulerInterface {
      */
     @Override
     public UUID addJob(String cron, CronTask task, boolean disallowOverlap) {
-        Objects.requireNonNull(cron);
-        Objects.requireNonNull(task);
-        CronExpr expr = CronExpr.parse(cron);
-        UUID id = UUID.randomUUID();
-        JobRecord rec = new JobRecord(id, expr, task, zone, disallowOverlap);
-        jobs.put(id, rec);
-        // первая дата запуска
-        Instant next = expr.next(Instant.now(), zone)
-                .orElseThrow(() -> new IllegalArgumentException("Cron has no future fire time: " + cron));
-        queue.offer(new ScheduledEntry(id, next.toEpochMilli()));
-        return id;
+        return addJob(cron, task, disallowOverlap, true); // старт сразу
     }
 
     /**

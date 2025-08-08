@@ -10,6 +10,8 @@ public interface CronSchedulerInterface extends AutoCloseable {
 
     void removeListener(JobEventListener l);
 
+    UUID addJob(String cron, CronTask task, boolean disallowOverlap, boolean runImmediately);
+
     UUID addJob(String cron, CronTask task);
 
     UUID addJob(String cron, CronTask task, boolean disallowOverlap);

@@ -22,7 +22,7 @@ public class CronTaskExample {
             MyCronTask task = new MyCronTask();
 
             // Запускаем каждые 10 секунд (теперь 6 полей cron)
-            UUID jobId = scheduler.addJob("*/10 * * * * *", task);
+            UUID jobId = scheduler.addJob("*/10 * * * * *", task, true, true);
 
             // Ждём 15 секунд и посылаем команду на остановку
             Thread.sleep(15000);
