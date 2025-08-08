@@ -1,4 +1,4 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.cron;
 
 import java.time.Instant;
 import java.time.ZoneId;
@@ -7,6 +7,7 @@ import java.util.BitSet;
 import java.util.Optional;
 
 // ======== CronExpr с поддержкой секунд (6 полей) ========
+
 /**
  * CronExpr — Cron expression parser and next-execution time calculator
  * with support for 6 fields (seconds precision).

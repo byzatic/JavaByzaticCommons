@@ -1,4 +1,4 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.cron;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -314,7 +314,10 @@ public final class CronScheduler implements CronSchedulerInterface {
         CancellationToken token = rec.tokenRef.get();
 
         if (f != null && !f.isDone()) {
-            try { rec.task.onStopRequested(); } catch (Throwable ignored) {}
+            try {
+                rec.task.onStopRequested();
+            } catch (Throwable ignored) {
+            }
             if (token != null) token.requestStop(reason);
 
             try {

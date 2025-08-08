@@ -1,7 +1,6 @@
 package io.github.byzatic.commons.schedulers.develop;
 
-
-import io.github.byzatic.commons.schedulers.cron.*;
+import io.github.byzatic.commons.schedulers.immediate.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -9,35 +8,42 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 
-class CronTaskExample {
-    private final static Logger logger = LoggerFactory.getLogger(CronTaskExample.class);
+class ImmediateTaskExample {
+    private static final Logger logger = LoggerFactory.getLogger(ImmediateTaskExample.class);
 
     public static void main(String[] args) throws Exception {
-        try (CronSchedulerInterface scheduler = new CronScheduler.Builder()
-                .defaultGrace(Duration.ofSeconds(5))
+        try (ImmediateSchedulerInterface scheduler = new ImmediateScheduler.Builder()
+                .defaultGrace(Duration.ofSeconds(3))
                 .addListener(new MyEventListener())
                 .build()
         ) {
             // Создаём задачу
-            MyCronTask task = new MyCronTask();
+            MyImmediateTask task = new MyImmediateTask();
 
-            // Запускаем каждые 10 секунд (теперь 6 полей cron)
-            UUID jobId = scheduler.addJob("*/10 * * * * *", task, true, true);
+            // Добавляем — она стартует СРАЗУ
+            UUID jobId = scheduler.addTask(task);
 
-            // Ждём 15 секунд и посылаем команду на остановку
-            Thread.sleep(15000);
+            // Ждём 2.5 секунды и просим мягко остановиться (grace = 1 сек)
+            Thread.sleep(2500);
             logger.debug("[MAIN] Requesting stop...");
-            scheduler.stopJob(jobId, Duration.ofSeconds(3));
+            scheduler.stopTask(jobId, Duration.ofSeconds(1));
 
             // Печатаем состояние
             scheduler.query(jobId).ifPresent(info ->
                     logger.debug("[MAIN] Final job state: " + info)
             );
+
+            // (Опционально) проверим, что отменили
+            scheduler.query(jobId).ifPresent(info -> {
+                if (info.state != JobState.CANCELLED && info.state != JobState.COMPLETED) {
+                    logger.warn("[MAIN] Unexpected state: " + info.state);
+                }
+            });
         }
     }
 
     /**
-     * Класс листнера, реализующей JobEventListener
+     * Класс листнера событий
      */
     public static class MyEventListener implements JobEventListener {
         @Override
@@ -66,46 +72,44 @@ class CronTaskExample {
         }
     }
 
-
     /**
-     * Класс задачи, реализующей CronTask
+     * Класс задачи для ImmediateScheduler
      */
-    public static class MyCronTask implements CronTask {
-        private final static Logger logger = LoggerFactory.getLogger(MyCronTask.class);
+    public static class MyImmediateTask implements Task {
+        private static final Logger log = LoggerFactory.getLogger(MyImmediateTask.class);
         private volatile boolean resourceOpen = false;
 
         @Override
         public void run(CancellationToken token) throws Exception {
-            logger.debug("Task started at " + Instant.now());
+            log.debug("Task started at " + Instant.now());
             // "Открываем" ресурс
             resourceOpen = true;
 
-            // Работаем 10 шагов
+            // Работаем 10 шагов по ~500мс
             for (int i = 1; i <= 10; i++) {
-                // Проверяем, не пришла ли команда на стоп
                 if (token.isStopRequested()) {
-                    logger.debug("Task stopping gracefully. Reason: " + token.reason());
+                    log.debug("Task stopping gracefully. Reason: " + token.reason());
                     cleanup();
                     return;
                 }
-                Thread.sleep(1000); // имитация работы
-                logger.debug("Step " + i);
+                Thread.sleep(500); // имитация работы
+                log.debug("Step " + i);
             }
             cleanup();
         }
 
         @Override
         public void onStopRequested() {
-            logger.debug("onStopRequested(): immediate reaction");
+            log.debug("onStopRequested(): immediate reaction");
             if (resourceOpen) {
-                logger.debug("Closing resource immediately from onStopRequested()");
+                log.debug("Closing resource immediately from onStopRequested()");
                 resourceOpen = false;
             }
         }
 
         private void cleanup() {
             if (resourceOpen) {
-                logger.debug("Cleaning up resource at the end of task");
+                log.debug("Cleaning up resource at the end of task");
                 resourceOpen = false;
             }
         }

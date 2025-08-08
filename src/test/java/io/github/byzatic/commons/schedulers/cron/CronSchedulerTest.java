@@ -1,4 +1,4 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.cron;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -37,7 +37,9 @@ class CronSchedulerTest {
         scheduler.addJob("*/1 * * * * *", token -> {
             int now = concurrent.incrementAndGet();
             maxConcurrent.accumulateAndGet(now, Math::max);
-            try { Thread.sleep(1500); } finally {
+            try {
+                Thread.sleep(1500);
+            } finally {
                 concurrent.decrementAndGet();
                 atLeastOneCompleted.countDown();
             }
@@ -54,8 +56,15 @@ class CronSchedulerTest {
 
         scheduler = new CronScheduler.Builder()
                 .addListener(new JobEventListener() {
-                    @Override public void onStart(UUID jobId) { started.countDown(); }
-                    @Override public void onCancelled(UUID jobId) { cancelledEvent.countDown(); }
+                    @Override
+                    public void onStart(UUID jobId) {
+                        started.countDown();
+                    }
+
+                    @Override
+                    public void onCancelled(UUID jobId) {
+                        cancelledEvent.countDown();
+                    }
                 })
                 .defaultGrace(Duration.ofMillis(200))
                 .build();
@@ -83,11 +92,15 @@ class CronSchedulerTest {
 
         scheduler = new CronScheduler.Builder().build();
         scheduler.addListener(new JobEventListener() {
-            @Override public void onStart(UUID jobId) { started.countDown(); }
+            @Override
+            public void onStart(UUID jobId) {
+                started.countDown();
+            }
         });
 
         // ВАЖНО: runImmediately = true
-        scheduler.addJob(veryRareCron, token -> {}, /*disallowOverlap*/ true, /*runImmediately*/ true);
+        scheduler.addJob(veryRareCron, token -> {
+        }, /*disallowOverlap*/ true, /*runImmediately*/ true);
 
         // Должно стартовать почти сразу
         assertTrue(started.await(1, TimeUnit.SECONDS), "Первый запуск не стартовал сразу при runImmediately=true");
@@ -101,11 +114,15 @@ class CronSchedulerTest {
 
         scheduler = new CronScheduler.Builder().build();
         scheduler.addListener(new JobEventListener() {
-            @Override public void onStart(UUID jobId) { started.countDown(); }
+            @Override
+            public void onStart(UUID jobId) {
+                started.countDown();
+            }
         });
 
         // ВАЖНО: runImmediately = false
-        scheduler.addJob(veryRareCron, token -> {}, /*disallowOverlap*/ true, /*runImmediately*/ false);
+        scheduler.addJob(veryRareCron, token -> {
+        }, /*disallowOverlap*/ true, /*runImmediately*/ false);
 
         // В ближайшую секунду старта быть не должно
         assertFalse(started.await(1, TimeUnit.SECONDS), "Запуск не должен происходить сразу при runImmediately=false");

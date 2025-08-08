@@ -1,4 +1,4 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.cron;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 

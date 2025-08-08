@@ -1,19 +1,28 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.cron;
 
 import org.junit.jupiter.api.Test;
+
 import java.util.concurrent.atomic.AtomicBoolean;
-import static org.junit.jupiter.api.Assertions.*;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CronTaskTest {
 
     static class MyTask implements CronTask {
         final AtomicBoolean ran = new AtomicBoolean(false);
         final AtomicBoolean stopHook = new AtomicBoolean(false);
-        @Override public void run(CancellationToken token) {
+
+        @Override
+        public void run(CancellationToken token) {
             ran.set(true);
             assertNotNull(token);
         }
-        @Override public void onStopRequested() { stopHook.set(true); }
+
+        @Override
+        public void onStopRequested() {
+            stopHook.set(true);
+        }
     }
 
     @Test

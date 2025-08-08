@@ -1,22 +1,20 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.immediate;
 
 import java.time.Instant;
 import java.util.UUID;
 
 /**
- * Информация о задаче (read-only).
+ * Информация о задаче.
  */
 public final class JobInfo {
     public final UUID id;
-    public final String cron;
     public final JobState state;
     public final Instant lastStart;
     public final Instant lastEnd;
     public final String lastError;
 
-    JobInfo(UUID id, String cron, JobState state, Instant lastStart, Instant lastEnd, String lastError) {
+    JobInfo(UUID id, JobState state, Instant lastStart, Instant lastEnd, String lastError) {
         this.id = id;
-        this.cron = cron;
         this.state = state;
         this.lastStart = lastStart;
         this.lastEnd = lastEnd;
@@ -25,8 +23,7 @@ public final class JobInfo {
 
     @Override
     public String toString() {
-        return "JobInfo{id=" + id + ", cron='" + cron + "', state=" + state +
-                ", lastStart=" + lastStart + ", lastEnd=" + lastEnd +
+        return "JobInfo{id=" + id + ", state=" + state + ", lastStart=" + lastStart + ", lastEnd=" + lastEnd +
                 (lastError != null ? ", lastError='" + lastError + '\'' : "") + '}';
     }
 }

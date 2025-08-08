@@ -1,9 +1,9 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.immediate;
 
 import java.util.UUID;
 
 /**
- * Слушатель событий по джобам.
+ * Слушатель событий по задачам.
  */
 public interface JobEventListener {
     default void onStart(UUID jobId) {

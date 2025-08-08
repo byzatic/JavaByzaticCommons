@@ -1,4 +1,4 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.cron;
 
 import org.junit.jupiter.api.Test;
 
@@ -12,7 +12,8 @@ class JobRecordTest {
     @Test
     void defaultFieldsAreCorrect() {
         CronExpr expr = CronExpr.parse("*/1 * * * * *");
-        CronTask task = token -> {};
+        CronTask task = token -> {
+        };
         JobRecord rec = new JobRecord(UUID.randomUUID(), expr, task, ZoneId.of("UTC"), true);
         assertEquals(JobState.SCHEDULED, rec.state);
         assertNull(rec.lastStart);

@@ -1,14 +1,15 @@
-package io.github.byzatic.commons.schedulers;
+package io.github.byzatic.commons.schedulers.cron;
 
 import org.junit.jupiter.api.Test;
-import static org.junit.jupiter.api.Assertions.*;
+
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CronSchedulerInterfaceTest {
 
     @Test
     void cronSchedulerImplementsInterfaceIfPresent() {
         try {
-            Class<?> iface = Class.forName("io.github.byzatic.commons.schedulers.CronSchedulerInterface");
+            Class<?> iface = Class.forName("io.github.byzatic.commons.schedulers.cron.CronSchedulerInterface");
             assertTrue(iface.isInterface(), "CronSchedulerInterface should be an interface");
             assertTrue(iface.isAssignableFrom(CronScheduler.class),
                     "CronScheduler should implement CronSchedulerInterface");
