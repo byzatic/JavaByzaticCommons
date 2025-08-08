@@ -1,7 +1,14 @@
 package io.github.byzatic.commons.schedulers;
 
-import org.jetbrains.annotations.NotNull;
+/**
+ * Интерфейс задачи. Обязательно проверяйте токен!
+ */
+public interface CronTask {
+    void run(CancellationToken token) throws Exception;
 
-public interface CronTask extends Task{
-    @NotNull String getCronExpressionString();
+    /**
+     * Вызывается при запросе мягкой остановки (опционально).
+     */
+    default void onStopRequested() {
+    }
 }

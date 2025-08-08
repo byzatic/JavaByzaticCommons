@@ -107,7 +107,8 @@
       <groupId>ch.qos.logback</groupId>
       <artifactId>logback-core</artifactId>
       <version>${version.logback}</version>
-      <scope>test</scope>
+<!--      <scope>test</scope>-->
+      <scope>runtime</scope>
     </dependency>
 
     <!-- https://mvnrepository.com/artifact/ch.qos.logback/logback-classic -->
@@ -115,7 +116,8 @@
       <groupId>ch.qos.logback</groupId>
       <artifactId>logback-classic</artifactId>
       <version>${version.logback}</version>
-      <scope>test</scope>
+<!--      <scope>test</scope>-->
+      <scope>runtime</scope>
     </dependency>
 
     <!-- https://mvnrepository.com/artifact/junit/junit -->
