@@ -7,6 +7,37 @@ import java.util.BitSet;
 import java.util.Optional;
 
 // ======== CronExpr с поддержкой секунд (6 полей) ========
+/**
+ * CronExpr — Cron expression parser and next-execution time calculator
+ * with support for 6 fields (seconds precision).
+ *
+ * <p>Syntax:</p>
+ * <pre>
+ * Field order:
+ *   [seconds] minutes hours day-of-month month day-of-week
+ *   If seconds omitted → defaults to 0
+ *
+ * Allowed formats per field:
+ *   *            — any value in the allowed range
+ *   a            — exact value (e.g., 5)
+ *   a-b          — range (inclusive) (e.g., 1-5)
+ *   &#42;&#47;n       — step values starting from min (e.g., &#42;&#47;15 = 0,15,30,45)
+ *   a-b&#47;n      — step within a range (e.g., 10-50&#47;10 = 10,20,30,40,50)
+ *   a,b,c        — comma-separated list
+ *
+ * Notes:
+ *   - Day-of-month AND day-of-week must match (logical AND)
+ *   - Ranges are inclusive
+ *   - Step works with '*' or range
+ *
+ * Examples:
+ *   0 * * * * *        — at the start of every minute
+ *   &#42;&#47;10 * * * * *     — every 10 seconds
+ *   0 0 12 * * 1-5     — at 12:00:00 Mon–Fri
+ *   30 15 10 1 * *     — at 10:15:30 on the first day of each month
+ *   * * * * * *        — every second
+ * </pre>
+ */
 final class CronExpr {
     // Если задано 6 полей: sec min hour dom mon dow
     // Если задано 5 полей:      min hour dom mon dow  (sec=0)
