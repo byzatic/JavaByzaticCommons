@@ -122,6 +122,37 @@ Destination dest = CustomConverter.parse(source, Destination.class);
 - Source and destination classes must have a no-argument constructor.
 - For collections, element types must also be convertible.
 
+---
+
+## CronScheduler (Quick Summary)
+
+A small cron-based scheduler for Java (5 or 6 fields, seconds supported).
+
+- Register jobs with `CronScheduler.addJob("0 * * * * *", task, true, true)`.
+- Job contract: `CronTask.run(CancellationToken token)` — check `token.throwIfStopRequested()` regularly.
+- Manage jobs: `stopJob(id, grace)`, `removeJob(id[, grace])`, `query(id)`, `listJobs()`.
+- Observe via `JobEventListener` (`onStart/onComplete/onError/onTimeout/onCancelled`).
+
+See the full guide: **[Cron-based Scheduler](.docs%2FREADME-Cron%E2%80%91Scheduler.md)** for syntax, events, and examples.
+
+ISSUE: [Job state may revert from TIMEOUT to RUNNING on frequent cron expressions](.docs%2FISSUE-Job_state_may_revert_from_TIMEOUT_to_RUNNING.md)
+
+---
+
+## ImmediateScheduler (Quick Summary)
+
+Run tasks **immediately** upon submission. Supports cooperative stop, grace period, hard timeout, and lifecycle events.
+
+- **Submit:** `UUID id = scheduler.addTask(task)` — starts right away.
+- **Stop:** `scheduler.stopTask(id, grace)` — cooperative stop, interrupt on timeout.
+- **Events:** Implement `JobEventListener` for start/complete/error/timeout/cancelled.
+- **State:** `scheduler.query(id)`, `scheduler.listJobs()`.
+- **Task:** implement `run(CancellationToken token)` and optionally `onStopRequested()`.
+
+See the full guide: **[Immediate Scheduler](.docs%2FREADME-immediate-scheduler.md)** for syntax, events, and examples.
+
+---
+
 ## RecursiveVfsDirectoryWatcher
 
 A lightweight, polling-based, **recursive** directory watcher built on Apache Commons VFS. It detects **file** events (`CREATED`, `MODIFIED`, `DELETED`) under a root directory (local or remote via VFS), with optional **rate limiting** and **debouncing** so you can tame event storms.
