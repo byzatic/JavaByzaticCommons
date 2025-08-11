@@ -10,12 +10,12 @@ import java.util.function.Consumer;
 
 /**
  * CronScheduler
- * - Планирование по cron (5 или 6 полей: [sec] min hour dom mon dow)
- * - Настраиваемый ThreadPoolExecutor
- * - Добавление/удаление задач в рантайме
- * - Мягкая остановка задач через CancellationToken + kill по таймауту
- * - Подписка на события (start/complete/error/timeout/cancelled)
- * - Запрет параллельных запусков одной задачи (disallowOverlap)
+ * - Scheduling via cron (5 or 6 fields: [sec] min hour dom mon dow)
+ * - Configurable ThreadPoolExecutor
+ * - Add/remove tasks at runtime
+ * - Soft task stop via CancellationToken + termination on timeout
+ * - Event subscription (start/complete/error/timeout/cancelled)
+ * - Prevent parallel execution of the same task (disallowOverlap)
  */
 public final class CronScheduler implements CronSchedulerInterface {
     private final ThreadPoolExecutor executor;
@@ -45,7 +45,7 @@ public final class CronScheduler implements CronSchedulerInterface {
         private final List<JobEventListener> listeners = new CopyOnWriteArrayList<>();
 
         /**
-         * Передайте свой настраиваемый пул.
+         * Provide your own custom thread pool.
          */
         public Builder executor(ThreadPoolExecutor executor) {
             this.executor = executor;
@@ -58,7 +58,7 @@ public final class CronScheduler implements CronSchedulerInterface {
         }
 
         /**
-         * Грейс по умолчанию при остановке задач.
+         * Default grace period when stopping tasks.
          */
         public Builder defaultGrace(Duration grace) {
             this.defaultGraceMillis = Objects.requireNonNull(grace).toMillis();
@@ -96,7 +96,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     // ======== Public API ========
 
     /**
-     * Зарегистрировать слушателя событий.
+     * Register an event listener.
      */
     @Override
     public void addListener(JobEventListener l) {
@@ -109,7 +109,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     /**
-     * Добавить задачу по cron и (опционально) стартовать её сразу.
+     * Add a task with a cron schedule and optionally start it immediately.
      */
     @Override
     public UUID addJob(String cron, CronTask task, boolean disallowOverlap, boolean runImmediately) {
@@ -131,7 +131,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     /**
-     * Добавить задачу по cron. Возвращает UUID джобы.
+     * Add a task with a cron schedule. Returns the job's UUID.
      */
     @Override
     public UUID addJob(String cron, CronTask task) {
@@ -139,7 +139,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     /**
-     * Добавить задачу по cron с опцией запрета параллельных запусков.
+     * Add a task with a cron schedule and an option to prevent parallel executions.
      */
     @Override
     public UUID addJob(String cron, CronTask task, boolean disallowOverlap) {
@@ -147,7 +147,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     /**
-     * Удалить задачу: снимает с планирования и пытается остановить текущий запуск по умолчанию с grace.
+     * Remove a task: unschedules it and attempts to stop the current run with the default grace period.
      */
     @Override
     public boolean removeJob(UUID jobId) {
@@ -165,7 +165,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     /**
-     * Команда мягкой остановки текущего запуска с последующим убийством по таймауту.
+     * Soft stop command for the current run, followed by termination on timeout.
      */
     @Override
     public void stopJob(UUID jobId, Duration grace) {
@@ -173,7 +173,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     /**
-     * Получить состояние/диагностику по задаче.
+     * Get the state/diagnostics for a task.
      */
     @Override
     public Optional<JobInfo> query(UUID jobId) {
@@ -183,7 +183,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     /**
-     * Список всех задач.
+     * List all tasks.
      */
     @Override
     public List<JobInfo> listJobs() {

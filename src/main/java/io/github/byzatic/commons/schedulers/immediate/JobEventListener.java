@@ -3,7 +3,7 @@ package io.github.byzatic.commons.schedulers.immediate;
 import java.util.UUID;
 
 /**
- * Слушатель событий по задачам.
+ * Task event listener.
  */
 public interface JobEventListener {
     default void onStart(UUID jobId) {

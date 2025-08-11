@@ -8,11 +8,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
- * ImmediateScheduler — простой планировщик без cron:
- * - Добавляешь задачу — она стартует сразу.
- * - Есть soft-cancel через CancellationToken и kill по таймауту.
- * - События: start/complete/error/timeout/cancelled.
- * - Настраиваемый ThreadPoolExecutor через Builder.
+ * ImmediateScheduler — a simple scheduler without cron:
+ * - Add a task — it starts immediately.
+ * - Supports soft-cancel via CancellationToken and termination on timeout.
+ * - Events: start/complete/error/timeout/cancelled.
+ * - Configurable ThreadPoolExecutor via Builder.
  */
 public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     private final ThreadPoolExecutor executor;
@@ -34,7 +34,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
         private final List<JobEventListener> listeners = new CopyOnWriteArrayList<>();
 
         /**
-         * Передайте свой настраиваемый пул.
+         * Provide your own custom thread pool.
          */
         public Builder executor(ThreadPoolExecutor executor) {
             this.executor = executor;
@@ -42,7 +42,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
         }
 
         /**
-         * Грейс по умолчанию при мягкой остановке.
+         * Default grace period for soft stop.
          */
         public Builder defaultGrace(Duration grace) {
             this.defaultGraceMillis = Objects.requireNonNull(grace).toMillis();
@@ -78,18 +78,24 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
 
     // ======== Public API ========
 
+    /**
+     * Register an event listener.
+     */
     @Override
     public void addListener(JobEventListener l) {
         listeners.add(Objects.requireNonNull(l));
     }
 
+    /**
+     * Remove an event listener.
+     */
     @Override
     public void removeListener(JobEventListener l) {
         listeners.remove(l);
     }
 
     /**
-     * Добавить задачу: она стартует немедленно. Возвращает UUID.
+     * Add a task: it starts immediately. Returns the UUID.
      */
     @Override
     public UUID addTask(Task task) {
@@ -102,7 +108,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     }
 
     /**
-     * Мягкая остановка текущего запуска с таймаутом и возможным прерыванием.
+     * Soft stop command for the current run, followed by termination on timeout.
      */
     @Override
     public void stopTask(UUID jobId, Duration grace) {
@@ -110,7 +116,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     }
 
     /**
-     * Удалить задачу: пытаемся остановить, затем убираем из реестра.
+     * Remove a task: unschedules it and attempts to stop the current run with the default grace period.
      */
     @Override
     public boolean removeTask(UUID jobId) {
@@ -128,7 +134,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     }
 
     /**
-     * Состояние.
+     * Get the state/diagnostics for a task.
      */
     @Override
     public Optional<JobInfo> query(UUID jobId) {
@@ -138,7 +144,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     }
 
     /**
-     * Все задачи.
+     * List all tasks.
      */
     @Override
     public List<JobInfo> listTasks() {

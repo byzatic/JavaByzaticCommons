@@ -3,7 +3,7 @@ package io.github.byzatic.commons.schedulers.cron;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Токен кооперативной отмены. Создаётся новый на каждый запуск.
+ * Cooperative cancellation token. Created anew for each run.
  */
 public final class CancellationToken {
     private final AtomicBoolean stop = new AtomicBoolean(false);
@@ -23,7 +23,7 @@ public final class CancellationToken {
     }
 
     /**
-     * Хелпер: бросает InterruptedException если пришёл стоп.
+     * Helper: throws InterruptedException if a stop has been requested.
      */
     public void throwIfStopRequested() throws InterruptedException {
         if (isStopRequested()) throw new InterruptedException("Stop requested: " + reason);

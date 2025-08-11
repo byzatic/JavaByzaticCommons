@@ -4,7 +4,7 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * Информация о задаче (read-only).
+ * Task information (read-only).
  */
 public final class JobInfo {
     public final UUID id;

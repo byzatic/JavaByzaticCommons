@@ -1,13 +1,13 @@
 package io.github.byzatic.commons.schedulers.immediate;
 
 /**
- * Интерфейс задачи. Обязательно периодически проверяйте токен!
+ * Task interface. Always check the token periodically!
  */
 public interface Task {
     void run(CancellationToken token) throws Exception;
 
     /**
-     * Вызывается сразу при запросе мягкой остановки (опционально).
+     * Called immediately when a soft stop is requested (optional).
      */
     default void onStopRequested() {
     }

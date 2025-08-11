@@ -3,7 +3,7 @@ package io.github.byzatic.commons.schedulers.cron;
 import java.util.UUID;
 
 /**
- * Слушатель событий по джобам.
+ * Job event listener.
  */
 public interface JobEventListener {
     default void onStart(UUID jobId) {
