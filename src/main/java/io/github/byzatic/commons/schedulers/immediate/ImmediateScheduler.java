@@ -19,6 +19,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -29,6 +30,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     private final CopyOnWriteArrayList<JobEventListener> listeners;
     private final ConcurrentMap<UUID, LegacyRecord> jobs = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final Object lifecycleLock = new Object();
     private final boolean ownsDelegate;
     private final LegacyEventBridge eventBridge;
 
@@ -76,14 +78,19 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     @Override
     public UUID addTask(Task task) {
         Objects.requireNonNull(task, "task");
-        RunHandle handle = delegate.submit(new io.github.byzatic.commons.schedulers.unified.ScheduledTask() {
-            @Override public void run(io.github.byzatic.commons.schedulers.unified.CancellationContext context) throws Exception {
-                task.run(CancellationToken.adapt(context));
-            }
-            @Override public void onCancellationRequested() { task.onStopRequested(); }
-        });
-        LegacyRecord record = new LegacyRecord(handle);
-        jobs.put(handle.id(), record);
+        RunHandle handle;
+        LegacyRecord record;
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            handle = delegate.submit(new io.github.byzatic.commons.schedulers.unified.ScheduledTask() {
+                @Override public void run(io.github.byzatic.commons.schedulers.unified.CancellationContext context) throws Exception {
+                    task.run(CancellationToken.adapt(context));
+                }
+                @Override public void onCancellationRequested() { task.onStopRequested(); }
+            });
+            record = new LegacyRecord(handle);
+            jobs.put(handle.id(), record);
+        }
         record.catchUp(handle);
         return handle.id();
     }
@@ -122,19 +129,29 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     }
 
     @Override public void close() {
-        if (!closed.compareAndSet(false, true)) return;
-        delegate.removeListener(eventBridge);
+        List<LegacyRecord> records;
+        synchronized (lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) return;
+            delegate.removeListener(eventBridge);
+            records = new ArrayList<>(jobs.values());
+        }
         if (ownsDelegate) {
             delegate.close();
             return;
         }
-        for (LegacyRecord record : new ArrayList<>(jobs.values())) {
+        for (LegacyRecord record : records) {
             RunHandle handle = record.handle;
             if (handle == null) continue;
             try { handle.cancel("Immediate facade closing", defaultGrace); }
             catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; }
         }
         jobs.clear();
+    }
+
+    private void ensureOpen() {
+        if (closed.get()) {
+            throw new RejectedExecutionException("Immediate scheduler facade is closed");
+        }
     }
 
     private Duration requireGrace(Duration grace) {
@@ -173,8 +190,8 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
         private void fireStart() {
             if (startSent.compareAndSet(false, true)) {
                 try {
-                    state = JobState.RUNNING;
                     start = Instant.now();
+                    state = JobState.RUNNING;
                     fire(listener -> listener.onStart(id));
                 } finally {
                     startPublished.complete(null);
@@ -211,6 +228,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
     }
 
     private void fire(java.util.function.Consumer<JobEventListener> event) {
+        if (closed.get()) return;
         for (JobEventListener listener : listeners) {
             try { event.accept(listener); } catch (Throwable ignored) { }
         }

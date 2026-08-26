@@ -20,6 +20,8 @@ final class SerialExecutionLane implements ExecutionLane {
     private final Queue<LaneTask> tasks = new ArrayDeque<>();
     private boolean accepting = true;
     private boolean draining;
+    /** Guarded by {@link #lock}; distinguishes graceful drain from forced shutdown. */
+    private boolean forceStopping;
     private boolean terminated;
     private RunHandle drainHandle;
 
@@ -62,6 +64,7 @@ final class SerialExecutionLane implements ExecutionLane {
         RunHandle currentDrain;
         synchronized (lock) {
             accepting = false;
+            forceStopping = true;
             LaneTask task;
             while ((task = tasks.poll()) != null) {
                 abandoned.add(task.command);
@@ -123,9 +126,21 @@ final class SerialExecutionLane implements ExecutionLane {
     private void dispatchDrain(boolean propagateRejection) {
         try {
             RunHandle submitted = scheduler.submit(this::drain);
+            boolean cancelSubmitted = false;
             synchronized (lock) {
                 if (draining) {
                     drainHandle = submitted;
+                    cancelSubmitted = forceStopping;
+                }
+            }
+            if (cancelSubmitted) {
+                try {
+                    submitted.cancel(
+                            "Execution lane '" + name + "' was stopped",
+                            Duration.ZERO
+                    );
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
                 }
             }
         } catch (RejectedExecutionException rejection) {

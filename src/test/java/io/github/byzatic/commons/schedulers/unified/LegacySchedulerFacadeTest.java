@@ -10,6 +10,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.*;
@@ -112,6 +113,69 @@ public class LegacySchedulerFacadeTest {
             immediate.close();
             cron.close();
             unified.close();
+        }
+    }
+
+    @Test
+    public void closedFacadesRejectNewRegistrations() {
+        UnifiedScheduler unified = UnifiedScheduler.builder().parallelism(2).build();
+        ImmediateScheduler immediate = ImmediateScheduler.adapt(unified);
+        CronScheduler cron = CronScheduler.adapt(
+                unified, java.time.ZoneId.of("UTC"), Duration.ofSeconds(1));
+        try {
+            immediate.close();
+            cron.close();
+            try {
+                immediate.addTask(cancellation -> { });
+                fail("Closed immediate facade must reject new tasks");
+            } catch (RejectedExecutionException expected) {
+                // expected
+            }
+            try {
+                cron.addJob("0 0 1 1 * *", cancellation -> { });
+                fail("Closed cron facade must reject new jobs");
+            } catch (RejectedExecutionException expected) {
+                // expected
+            }
+        } finally {
+            immediate.close();
+            cron.close();
+            unified.close();
+        }
+    }
+
+    @Test
+    public void cronFacadeDiscardsCompletedRunDeduplicationMetadata() throws Exception {
+        CountDownLatch completed = new CountDownLatch(1);
+        CronScheduler scheduler = new CronScheduler.Builder()
+                .zone(java.time.ZoneId.of("UTC"))
+                .addListener(new io.github.byzatic.commons.schedulers.cron.JobEventListener() {
+                    @Override public void onComplete(UUID jobId) { completed.countDown(); }
+                })
+                .build();
+        try {
+            UUID scheduleId = scheduler.addJob(
+                    "0 0 1 1 * *", cancellation -> { }, true, true);
+            assertTrue(completed.await(1L, TimeUnit.SECONDS));
+
+            java.lang.reflect.Field jobsField = CronScheduler.class.getDeclaredField("jobs");
+            jobsField.setAccessible(true);
+            java.util.Map<?, ?> jobs = (java.util.Map<?, ?>) jobsField.get(scheduler);
+            Object record = jobs.get(scheduleId);
+            java.lang.reflect.Field startsField = record.getClass().getDeclaredField("starts");
+            java.lang.reflect.Field terminalsField = record.getClass().getDeclaredField("terminals");
+            startsField.setAccessible(true);
+            terminalsField.setAccessible(true);
+            java.util.Map<?, ?> starts = (java.util.Map<?, ?>) startsField.get(record);
+            java.util.Set<?> terminals = (java.util.Set<?>) terminalsField.get(record);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1L);
+            while ((!starts.isEmpty() || !terminals.isEmpty()) && System.nanoTime() < deadline) {
+                Thread.sleep(1L);
+            }
+            assertTrue(starts.isEmpty());
+            assertTrue(terminals.isEmpty());
+        } finally {
+            scheduler.close();
         }
     }
 }

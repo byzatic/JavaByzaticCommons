@@ -28,6 +28,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -39,6 +40,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     private final CopyOnWriteArrayList<JobEventListener> listeners;
     private final ConcurrentMap<UUID, LegacyCronJob> jobs = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final Object lifecycleLock = new Object();
     private final boolean ownsDelegate;
     private final LegacyEventBridge eventBridge;
 
@@ -101,14 +103,19 @@ public final class CronScheduler implements CronSchedulerInterface {
                 .failurePolicy(FailurePolicy.CONTINUE)
                 .cancellationGrace(defaultGrace)
                 .build();
-        ScheduleHandle handle = delegate.schedule(new io.github.byzatic.commons.schedulers.unified.ScheduledTask() {
-            @Override public void run(io.github.byzatic.commons.schedulers.unified.CancellationContext context) throws Exception {
-                task.run(CancellationToken.adapt(context));
-            }
-            @Override public void onCancellationRequested() { task.onStopRequested(); }
-        }, cronSchedule, options);
-        LegacyCronJob record = new LegacyCronJob(handle, cron);
-        jobs.put(handle.id(), record);
+        ScheduleHandle handle;
+        LegacyCronJob record;
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            handle = delegate.schedule(new io.github.byzatic.commons.schedulers.unified.ScheduledTask() {
+                @Override public void run(io.github.byzatic.commons.schedulers.unified.CancellationContext context) throws Exception {
+                    task.run(CancellationToken.adapt(context));
+                }
+                @Override public void onCancellationRequested() { task.onStopRequested(); }
+            }, cronSchedule, options);
+            record = new LegacyCronJob(handle, cron);
+            jobs.put(handle.id(), record);
+        }
         record.catchUp();
         return handle.id();
     }
@@ -149,17 +156,27 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     @Override public void close() {
-        if (!closed.compareAndSet(false, true)) return;
-        delegate.removeListener(eventBridge);
+        List<LegacyCronJob> records;
+        synchronized (lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) return;
+            delegate.removeListener(eventBridge);
+            records = new ArrayList<>(jobs.values());
+        }
         if (ownsDelegate) {
             delegate.close();
             return;
         }
-        for (LegacyCronJob record : new ArrayList<>(jobs.values())) {
+        for (LegacyCronJob record : records) {
             try { record.handle.cancel(defaultGrace); }
             catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; }
         }
         jobs.clear();
+    }
+
+    private void ensureOpen() {
+        if (closed.get()) {
+            throw new RejectedExecutionException("Cron scheduler facade is closed");
+        }
     }
 
     private final class LegacyEventBridge implements ScheduleEventListener {
@@ -179,6 +196,7 @@ public final class CronScheduler implements CronSchedulerInterface {
         private final ConcurrentMap<UUID, CompletableFuture<Void>> starts =
                 new ConcurrentHashMap<>();
         private final Set<UUID> terminals = ConcurrentHashMap.newKeySet();
+        private final AtomicBoolean registrationComplete = new AtomicBoolean(false);
         private volatile JobState state = JobState.SCHEDULED;
         private volatile Instant lastStart;
         private volatile Instant lastEnd;
@@ -186,8 +204,14 @@ public final class CronScheduler implements CronSchedulerInterface {
 
         private LegacyCronJob(ScheduleHandle handle, String cron) { this.handle = handle; this.cron = cron; }
         private void catchUp() {
-            for (RunHandle run : handle.activeRuns()) onStart(run.id());
-            handle.lastOutcome().ifPresent(this::onOutcome);
+            try {
+                for (RunHandle run : handle.activeRuns()) onStart(run.id());
+                handle.lastOutcome().ifPresent(this::onOutcome);
+            } finally {
+                registrationComplete.set(true);
+                for (UUID terminalRun : terminals) starts.remove(terminalRun);
+                terminals.clear();
+            }
         }
         private void onStart(UUID runId) {
             CompletableFuture<Void> publication = new CompletableFuture<>();
@@ -197,8 +221,8 @@ public final class CronScheduler implements CronSchedulerInterface {
                 return;
             }
             try {
-                state = JobState.RUNNING;
                 lastStart = Instant.now();
+                state = JobState.RUNNING;
                 fire(listener -> listener.onStart(handle.id()));
             } finally {
                 publication.complete(null);
@@ -215,6 +239,10 @@ public final class CronScheduler implements CronSchedulerInterface {
             else if (state == JobState.FAILED) fire(listener -> listener.onError(handle.id(), outcome.failure().orElse(null)));
             else if (state == JobState.TIMEOUT) fire(listener -> listener.onTimeout(handle.id()));
             else if (state == JobState.CANCELLED) fire(listener -> listener.onCancelled(handle.id()));
+            if (registrationComplete.get()) {
+                terminals.remove(outcome.runId());
+                starts.remove(outcome.runId());
+            }
         }
         private JobInfo snapshot() { return new JobInfo(handle.id(), cron, state, lastStart, lastEnd, lastError); }
     }
@@ -244,6 +272,7 @@ public final class CronScheduler implements CronSchedulerInterface {
     }
 
     private void fire(java.util.function.Consumer<JobEventListener> event) {
+        if (closed.get()) return;
         for (JobEventListener listener : listeners) {
             try { event.accept(listener); } catch (Throwable ignored) { }
         }

@@ -16,6 +16,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.Assert.*;
 
@@ -284,5 +285,190 @@ public class UnifiedSchedulerTest {
         assertTrue(returnedFromClose.await(1, TimeUnit.SECONDS));
         assertEquals(RunState.CANCELLED, run.await(Duration.ofSeconds(1)).state());
         assertTrue(scheduler.awaitTermination(Duration.ofSeconds(1)));
+    }
+
+    @Test
+    public void cancellingDequeuedRunPublishesScheduleExitOnlyOnce() throws Exception {
+        CountDownLatch dequeued = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        AtomicBoolean pauseFirstTask = new AtomicBoolean(true);
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(4),
+                java.util.concurrent.Executors.defaultThreadFactory(),
+                new ThreadPoolExecutor.AbortPolicy()) {
+            @Override protected void beforeExecute(Thread thread, Runnable command) {
+                if (pauseFirstTask.compareAndSet(true, false)) {
+                    dequeued.countDown();
+                    try {
+                        releaseWorker.await();
+                    } catch (InterruptedException interrupted) {
+                        thread.interrupt();
+                    }
+                }
+            }
+        };
+        UnifiedScheduler scheduler = UnifiedScheduler.builder().executor(executor).build();
+        try {
+            ScheduleHandle schedule = scheduler.schedule(
+                    cancellation -> { },
+                    Schedules.fixedDelay(Duration.ZERO, Duration.ofDays(1)));
+            assertTrue(dequeued.await(1, TimeUnit.SECONDS));
+            RunHandle run = awaitActiveRun(schedule);
+            assertTrue(run.requestCancellation("test cancellation after dequeue"));
+            releaseWorker.countDown();
+            Thread.sleep(50L);
+
+            java.lang.reflect.Field triggersField = UnifiedScheduler.class.getDeclaredField("triggers");
+            triggersField.setAccessible(true);
+            java.util.concurrent.DelayQueue<?> triggerQueue =
+                    (java.util.concurrent.DelayQueue<?>) triggersField.get(scheduler);
+            assertEquals("Fixed-delay continuation must be registered exactly once", 1, triggerQueue.size());
+            schedule.cancel(Duration.ZERO);
+        } finally {
+            releaseWorker.countDown();
+            scheduler.close();
+        }
+    }
+
+    @Test
+    public void registrationAndShutdownAreLinearized() throws Exception {
+        for (int iteration = 0; iteration < 100; iteration++) {
+            UnifiedScheduler scheduler = UnifiedScheduler.builder().singleThreaded().build();
+            CountDownLatch start = new CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicReference<RunHandle> accepted =
+                    new java.util.concurrent.atomic.AtomicReference<>();
+            Thread submitter = new Thread(() -> {
+                try {
+                    start.await();
+                    accepted.set(scheduler.schedule(cancellation -> { }, Duration.ofDays(1)));
+                } catch (RejectedExecutionException expected) {
+                    // Shutdown won the lifecycle race.
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            submitter.start();
+            start.countDown();
+            scheduler.shutdown();
+            submitter.join();
+            RunHandle run = accepted.get();
+            if (run != null) {
+                assertEquals(RunState.CANCELLED,
+                        run.await(Duration.ofSeconds(1)).state());
+            }
+            assertTrue(scheduler.awaitTermination(Duration.ofSeconds(1)));
+        }
+    }
+
+    @Test
+    public void forcedLaneShutdownCancelsDrainWhoseHandleIsStillBeingPublished() throws Exception {
+        UnifiedScheduler delegate = UnifiedScheduler.builder().singleThreaded().build();
+        CountDownLatch submitReached = new CountDownLatch(1);
+        CountDownLatch returnHandle = new CountDownLatch(1);
+        CountDownLatch taskStarted = new CountDownLatch(1);
+        CountDownLatch taskInterrupted = new CountDownLatch(1);
+        UnifiedSchedulerInterface delayedReturn = (UnifiedSchedulerInterface)
+                java.lang.reflect.Proxy.newProxyInstance(
+                        UnifiedSchedulerInterface.class.getClassLoader(),
+                        new Class<?>[]{UnifiedSchedulerInterface.class},
+                        (proxy, method, arguments) -> {
+                            try {
+                                Object result = method.invoke(delegate, arguments);
+                                if (method.getName().equals("submit")
+                                        && method.getParameterTypes()[0] == Runnable.class) {
+                                    submitReached.countDown();
+                                    returnHandle.await();
+                                }
+                                return result;
+                            } catch (java.lang.reflect.InvocationTargetException failure) {
+                                throw failure.getCause();
+                            }
+                        });
+        ExecutionLane lane = new SerialExecutionLane(delayedReturn, "publication-race");
+        Thread submitter = new Thread(() -> lane.submit(() -> {
+            taskStarted.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException expected) {
+                taskInterrupted.countDown();
+                Thread.currentThread().interrupt();
+            }
+        }));
+        try {
+            submitter.start();
+            assertTrue(submitReached.await(1L, TimeUnit.SECONDS));
+            assertTrue(taskStarted.await(1L, TimeUnit.SECONDS));
+            lane.shutdownNow();
+            returnHandle.countDown();
+            submitter.join(1_000L);
+            assertTrue(taskInterrupted.await(1L, TimeUnit.SECONDS));
+            assertTrue(lane.awaitTermination(Duration.ofSeconds(1L)));
+        } finally {
+            returnHandle.countDown();
+            lane.shutdownNow();
+            delegate.close();
+        }
+    }
+
+    @Test
+    public void forcedCancellationCannotPublishTerminalBeforeStartListenerReturns() throws Exception {
+        CountDownLatch startEntered = new CountDownLatch(1);
+        CountDownLatch allowStartToReturn = new CountDownLatch(1);
+        CountDownLatch terminal = new CountDownLatch(1);
+        AtomicBoolean startReturned = new AtomicBoolean(false);
+        AtomicBoolean terminalBeforeStart = new AtomicBoolean(false);
+        UnifiedScheduler scheduler = UnifiedScheduler.builder()
+                .singleThreaded()
+                .addListener(new ScheduleEventListener() {
+                    @Override public void onRunStart(java.util.UUID scheduleId, java.util.UUID runId) {
+                        startEntered.countDown();
+                        try {
+                            allowStartToReturn.await();
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                        } finally {
+                            startReturned.set(true);
+                        }
+                    }
+
+                    @Override public void onRunComplete(java.util.UUID scheduleId, RunOutcome outcome) {
+                        if (!startReturned.get()) terminalBeforeStart.set(true);
+                        terminal.countDown();
+                    }
+                })
+                .build();
+        try {
+            RunHandle run = scheduler.submit(cancellation -> { });
+            assertTrue(startEntered.await(1L, TimeUnit.SECONDS));
+            Thread canceller = new Thread(() -> {
+                try {
+                    run.cancel("forced test cancellation", Duration.ZERO);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            canceller.start();
+            assertFalse("terminal publication must wait for start publication",
+                    terminal.await(50L, TimeUnit.MILLISECONDS));
+            allowStartToReturn.countDown();
+            canceller.join(1_000L);
+            assertTrue(terminal.await(1L, TimeUnit.SECONDS));
+            assertFalse(terminalBeforeStart.get());
+        } finally {
+            allowStartToReturn.countDown();
+            scheduler.close();
+        }
+    }
+
+    private static RunHandle awaitActiveRun(ScheduleHandle schedule) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1L);
+        while (System.nanoTime() < deadline) {
+            List<RunHandle> runs = schedule.activeRuns();
+            if (!runs.isEmpty()) return runs.get(0);
+            Thread.sleep(1L);
+        }
+        fail("Schedule did not publish its active run");
+        throw new AssertionError("unreachable");
     }
 }
