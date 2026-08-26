@@ -53,6 +53,23 @@ resume, cancellation, next-fire time, active runs, and the last outcome.
 Completed one-shot runs are removed from scheduler-owned registries. Recurring schedules retain
 only their active runs and last outcome.
 
+## Logical serial lanes
+
+Use a serial lane when one mutable component needs strict FIFO ownership while the application
+shares a parallel scheduler:
+
+```java
+ExecutionLane reloadLane = scheduler.serialLane("project-reload");
+CompletionStage<Void> applied = reloadLane.submit(() -> applyRevision(revision));
+```
+
+A lane never creates an executor or owns a thread. It borrows one scheduler worker for its drain
+loop, runs accepted commands without overlap, and immediately removes completed queue entries.
+The physical worker may change after an idle period, so the contract is logical serialization,
+not thread identity. Each returned stage propagates the command failure. `shutdown()` drains,
+`shutdownNow()` rejects queued work and interrupts the active drain when possible, and
+`awaitTermination(Duration)` waits only for the lane without closing the shared scheduler.
+
 ## Cancellation and shutdown
 
 Tasks should periodically call `CancellationContext.throwIfCancellationRequested()` or inspect

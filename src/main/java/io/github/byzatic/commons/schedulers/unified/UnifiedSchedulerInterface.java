@@ -6,6 +6,8 @@ import java.util.Optional;
 import java.util.UUID;
 
 public interface UnifiedSchedulerInterface extends AutoCloseable {
+    /** Creates a FIFO serial lane that borrows workers from this scheduler. */
+    ExecutionLane serialLane(String name);
     RunHandle submit(ScheduledTask task);
     RunHandle submit(Runnable task);
     RunHandle schedule(ScheduledTask task, Duration delay);

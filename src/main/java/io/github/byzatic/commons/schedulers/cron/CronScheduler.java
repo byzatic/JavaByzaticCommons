@@ -24,6 +24,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -175,7 +176,8 @@ public final class CronScheduler implements CronSchedulerInterface {
     private final class LegacyCronJob {
         private final ScheduleHandle handle;
         private final String cron;
-        private final Set<UUID> starts = ConcurrentHashMap.newKeySet();
+        private final ConcurrentMap<UUID, CompletableFuture<Void>> starts =
+                new ConcurrentHashMap<>();
         private final Set<UUID> terminals = ConcurrentHashMap.newKeySet();
         private volatile JobState state = JobState.SCHEDULED;
         private volatile Instant lastStart;
@@ -188,10 +190,22 @@ public final class CronScheduler implements CronSchedulerInterface {
             handle.lastOutcome().ifPresent(this::onOutcome);
         }
         private void onStart(UUID runId) {
-            if (!starts.add(runId)) return;
-            state = JobState.RUNNING; lastStart = Instant.now(); fire(listener -> listener.onStart(handle.id()));
+            CompletableFuture<Void> publication = new CompletableFuture<>();
+            CompletableFuture<Void> existing = starts.putIfAbsent(runId, publication);
+            if (existing != null) {
+                existing.join();
+                return;
+            }
+            try {
+                state = JobState.RUNNING;
+                lastStart = Instant.now();
+                fire(listener -> listener.onStart(handle.id()));
+            } finally {
+                publication.complete(null);
+            }
         }
         private void onOutcome(RunOutcome outcome) {
+            onStart(outcome.runId());
             if (!terminals.add(outcome.runId())) return;
             outcome.startedAt().ifPresent(value -> lastStart = value);
             lastEnd = outcome.completedAt();

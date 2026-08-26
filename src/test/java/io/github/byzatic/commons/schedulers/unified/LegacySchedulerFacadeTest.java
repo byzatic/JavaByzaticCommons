@@ -6,12 +6,45 @@ import org.junit.Test;
 
 import java.time.Duration;
 import java.util.UUID;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.*;
 
 public class LegacySchedulerFacadeTest {
+
+    @Test
+    public void immediateFacadeHandlesCompletionRacingWithRegistration() throws Exception {
+        int taskCount = 25_000;
+        CountDownLatch completed = new CountDownLatch(taskCount);
+        Set<UUID> started = ConcurrentHashMap.newKeySet();
+        AtomicInteger terminalBeforeStart = new AtomicInteger();
+        UnifiedScheduler unified = UnifiedScheduler.builder()
+                .parallelism(8)
+                .queueCapacity(taskCount)
+                .build();
+        ImmediateScheduler scheduler = ImmediateScheduler.adapt(unified);
+        scheduler.addListener(new io.github.byzatic.commons.schedulers.immediate.JobEventListener() {
+            @Override public void onStart(UUID jobId) { started.add(jobId); }
+            @Override public void onComplete(UUID jobId) {
+                if (!started.contains(jobId)) terminalBeforeStart.incrementAndGet();
+                completed.countDown();
+            }
+        });
+        try {
+            for (int index = 0; index < taskCount; index++) {
+                scheduler.addTask(cancellation -> { });
+            }
+            assertTrue(completed.await(5L, TimeUnit.SECONDS));
+            assertEquals(0, terminalBeforeStart.get());
+        } finally {
+            scheduler.close();
+            unified.close();
+        }
+    }
 
     @Test
     public void immediateFacadeRetainsLegacyQueryContract() throws Exception {

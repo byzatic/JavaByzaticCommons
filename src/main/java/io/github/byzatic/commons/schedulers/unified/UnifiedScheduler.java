@@ -21,6 +21,7 @@ import java.util.concurrent.Delayed;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -33,6 +34,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@link ThreadPoolExecutor}; the timer dispatcher only transfers due work to that executor.
  */
 public final class UnifiedScheduler implements UnifiedSchedulerInterface {
+    private static final int MAX_TRIGGER_DISPATCH_BATCH = 1_024;
+
     private final ThreadPoolExecutor executor;
     private final Clock clock;
     private final ShutdownPolicy shutdownPolicy;
@@ -56,6 +59,12 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     }
 
     public static Builder builder() { return new Builder(); }
+
+    @Override
+    public ExecutionLane serialLane(String name) {
+        ensureAccepting();
+        return new SerialExecutionLane(this, name);
+    }
 
     @Override
     public RunHandle submit(ScheduledTask task) {
@@ -191,20 +200,34 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     }
 
     private void dispatchLoop() {
+        List<TriggerEntry> dueTriggers = new ArrayList<>(MAX_TRIGGER_DISPATCH_BATCH);
         try {
             while (dispatcherRunning.get()) {
                 try {
                     TriggerEntry trigger = triggers.take();
-                    if (trigger.run != null) dispatchDelayedRun(trigger.run);
-                    else if (trigger.schedule != null) trigger.schedule.onTrigger(trigger);
+                    dispatchTriggerSafely(trigger);
+                    triggers.drainTo(dueTriggers, MAX_TRIGGER_DISPATCH_BATCH);
+                    for (TriggerEntry dueTrigger : dueTriggers) {
+                        if (!dispatcherRunning.get()) break;
+                        dispatchTriggerSafely(dueTrigger);
+                    }
                 } catch (InterruptedException interrupted) {
                     if (!dispatcherRunning.get()) break;
-                } catch (Throwable ignored) {
-                    // A malformed schedule must not terminate timing for unrelated schedules.
+                } finally {
+                    dueTriggers.clear();
                 }
             }
         } finally {
             dispatcherTerminated.countDown();
+        }
+    }
+
+    private void dispatchTriggerSafely(TriggerEntry trigger) {
+        try {
+            if (trigger.run != null) dispatchDelayedRun(trigger.run);
+            else if (trigger.schedule != null) trigger.schedule.onTrigger(trigger);
+        } catch (Throwable ignored) {
+            // A malformed schedule must not terminate timing for unrelated schedules.
         }
     }
 
@@ -234,6 +257,17 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     }
 
     private long nextSequence() { return triggerSequence.incrementAndGet(); }
+
+    private static UUID newIdentifier() {
+        // Scheduler identifiers are correlation keys, not security tokens. Thread-local random
+        // generation avoids the SecureRandom contention and digest allocation of UUID.randomUUID().
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        long mostSignificantBits = random.nextLong();
+        long leastSignificantBits = random.nextLong();
+        mostSignificantBits = (mostSignificantBits & 0xffffffffffff0fffL) | 0x0000000000004000L;
+        leastSignificantBits = (leastSignificantBits & 0x3fffffffffffffffL) | 0x8000000000000000L;
+        return new UUID(mostSignificantBits, leastSignificantBits);
+    }
 
     private boolean isCurrentWorkerThread() {
         Thread current = Thread.currentThread();
@@ -295,7 +329,7 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     }
 
     private final class RunControl implements RunHandle, Runnable {
-        private final UUID id = UUID.randomUUID();
+        private final UUID id = newIdentifier();
         private final ScheduleControl owner;
         private final ScheduledTask task;
         private final CancellationContext cancellation = new CancellationContext();
@@ -324,7 +358,6 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
                 return;
             }
             runner = Thread.currentThread();
-            String originalThreadName = runner.getName();
             startedAt = clock.instant();
             fireStart(owner == null ? null : owner.id(), id);
             try {
@@ -336,7 +369,6 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
             } catch (Throwable failure) {
                 publish(RunState.FAILED, failure);
             } finally {
-                try { Thread.currentThread().setName(originalThreadName); } catch (RuntimeException ignored) { }
                 runner = null;
                 actualExecutionFinished();
             }
@@ -448,7 +480,7 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     }
 
     private final class ScheduleControl implements ScheduleHandle {
-        private final UUID id = UUID.randomUUID();
+        private final UUID id = newIdentifier();
         private final ScheduledTask task;
         private final Schedule schedule;
         private final ScheduleOptions options;

@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -83,7 +84,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
         });
         LegacyRecord record = new LegacyRecord(handle);
         jobs.put(handle.id(), record);
-        record.catchUp();
+        record.catchUp(handle);
         return handle.id();
     }
 
@@ -157,6 +158,7 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
         private final UUID id;
         private volatile RunHandle handle;
         private final AtomicBoolean startSent = new AtomicBoolean(false);
+        private final CompletableFuture<Void> startPublished = new CompletableFuture<>();
         private final AtomicBoolean terminalSent = new AtomicBoolean(false);
         private volatile JobState state = JobState.SCHEDULED;
         private volatile Instant start;
@@ -164,16 +166,25 @@ public final class ImmediateScheduler implements ImmediateSchedulerInterface {
         private volatile String error;
 
         private LegacyRecord(RunHandle handle) { this.id = handle.id(); this.handle = handle; }
-        private void catchUp() {
-            RunHandle current = handle;
+        private void catchUp(RunHandle current) {
             if (current.state() != RunState.WAITING && current.state() != RunState.QUEUED) fireStart();
             current.completion().thenAccept(this::accept);
         }
         private void fireStart() {
-            if (!startSent.compareAndSet(false, true)) return;
-            state = JobState.RUNNING; start = Instant.now(); fire(listener -> listener.onStart(id));
+            if (startSent.compareAndSet(false, true)) {
+                try {
+                    state = JobState.RUNNING;
+                    start = Instant.now();
+                    fire(listener -> listener.onStart(id));
+                } finally {
+                    startPublished.complete(null);
+                }
+                return;
+            }
+            startPublished.join();
         }
         private void accept(RunOutcome outcome) {
+            fireStart();
             if (!terminalSent.compareAndSet(false, true)) return;
             outcome.startedAt().ifPresent(value -> start = value);
             end = outcome.completedAt();

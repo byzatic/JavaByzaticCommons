@@ -10,6 +10,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -18,6 +20,79 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.Assert.*;
 
 public class UnifiedSchedulerTest {
+
+    @Test
+    public void serialLanePreservesFifoWithoutOwningAnotherExecutor() throws Exception {
+        UnifiedScheduler scheduler = UnifiedScheduler.builder().parallelism(4).build();
+        ExecutionLane lane = scheduler.serialLane("reload");
+        try {
+            AtomicInteger active = new AtomicInteger();
+            AtomicInteger maximumActive = new AtomicInteger();
+            List<Integer> order = Collections.synchronizedList(new ArrayList<>());
+            List<CompletionStage<Void>> completions = new ArrayList<>();
+            for (int index = 0; index < 50; index++) {
+                final int value = index;
+                completions.add(lane.submit(() -> {
+                    int current = active.incrementAndGet();
+                    maximumActive.accumulateAndGet(current, Math::max);
+                    order.add(value);
+                    active.decrementAndGet();
+                }));
+            }
+            CompletableFuture.allOf(completions.stream()
+                    .map(CompletionStage::toCompletableFuture)
+                    .toArray(CompletableFuture[]::new)).get(2, TimeUnit.SECONDS);
+            lane.shutdown();
+            assertTrue(lane.awaitTermination(Duration.ofSeconds(1)));
+            assertEquals(1, maximumActive.get());
+            for (int index = 0; index < 50; index++) assertEquals(index, order.get(index).intValue());
+        } finally {
+            lane.close();
+            scheduler.close();
+        }
+    }
+
+    @Test
+    public void serialLaneReportsTaskFailureAndSupportsForcedShutdown() throws Exception {
+        UnifiedScheduler scheduler = UnifiedScheduler.builder().parallelism(2).build();
+        ExecutionLane lane = scheduler.serialLane("cancellable");
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        try {
+            CompletionStage<Void> failed = lane.submit(() -> {
+                throw new IllegalStateException("expected");
+            });
+            try {
+                failed.toCompletableFuture().get(1, TimeUnit.SECONDS);
+                fail("Lane task failure must be propagated");
+            } catch (java.util.concurrent.ExecutionException expected) {
+                assertTrue(expected.getCause() instanceof IllegalStateException);
+            }
+
+            lane.submit(() -> {
+                started.countDown();
+                try {
+                    new CountDownLatch(1).await();
+                } catch (InterruptedException expected) {
+                    interrupted.countDown();
+                    Thread.currentThread().interrupt();
+                }
+            });
+            assertTrue(started.await(1, TimeUnit.SECONDS));
+            lane.shutdownNow();
+            assertTrue(interrupted.await(1, TimeUnit.SECONDS));
+            assertTrue(lane.awaitTermination(Duration.ofSeconds(1)));
+            try {
+                lane.submit(() -> { });
+                fail("Closed lane must reject new work");
+            } catch (RejectedExecutionException expected) {
+                // expected
+            }
+        } finally {
+            lane.shutdownNow();
+            scheduler.close();
+        }
+    }
 
     @Test
     public void singleThreadModeIsSequentialAndOrdered() throws Exception {
@@ -49,6 +124,26 @@ public class UnifiedSchedulerTest {
     }
 
     @Test
+    public void runAndScheduleIdentifiersRemainRfc4122VersionFourUuids() throws Exception {
+        UnifiedScheduler scheduler = UnifiedScheduler.builder().singleThreaded().build();
+        try {
+            RunHandle run = scheduler.submit(() -> { });
+            ScheduleHandle schedule = scheduler.schedule(
+                    cancellation -> { },
+                    Schedules.after(Duration.ofMillis(10L))
+            );
+
+            assertEquals(4, run.id().version());
+            assertEquals(2, run.id().variant());
+            assertEquals(4, schedule.id().version());
+            assertEquals(2, schedule.id().variant());
+            assertEquals(RunState.COMPLETED, run.await(Duration.ofSeconds(1L)).state());
+        } finally {
+            scheduler.close();
+        }
+    }
+
+    @Test
     public void delayedAndFixedDelayTasksUseTheSameExecutor() throws Exception {
         UnifiedScheduler scheduler = UnifiedScheduler.builder().singleThreaded().build();
         try {
@@ -64,6 +159,27 @@ public class UnifiedSchedulerTest {
                     ScheduleOptions.builder().overlapPolicy(OverlapPolicy.SKIP).build());
             assertTrue(repeated.await(2, TimeUnit.SECONDS));
             assertTrue(schedule.cancel(Duration.ofSeconds(1)));
+        } finally {
+            scheduler.close();
+        }
+    }
+
+    @Test
+    public void dueTriggerBatchDoesNotLoseDelayedRuns() throws Exception {
+        int taskCount = 2_500;
+        UnifiedScheduler scheduler = UnifiedScheduler.builder()
+                .parallelism(4)
+                .queueCapacity(taskCount)
+                .build();
+        CountDownLatch completed = new CountDownLatch(taskCount);
+        try {
+            for (int index = 0; index < taskCount; index++) {
+                scheduler.schedule(
+                        cancellation -> completed.countDown(),
+                        Duration.ofMillis(10L)
+                );
+            }
+            assertTrue(completed.await(5L, TimeUnit.SECONDS));
         } finally {
             scheduler.close();
         }
