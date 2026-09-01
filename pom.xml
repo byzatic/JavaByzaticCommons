@@ -4,8 +4,8 @@
 
   <groupId>io.github.byzatic</groupId>
   <artifactId>java-byzatic-commons</artifactId>
-  <version>0.0.6</version>
-  <!--<version>0.0.6-SNAPSHOT</version>-->
+  <!--<version>0.0.7</version>-->
+  <version>0.0.7</version>
   <packaging>jar</packaging>
 
   <name>JavaByzaticCommons</name>
@@ -125,6 +125,14 @@
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter-engine</artifactId>
+      <version>5.7.1</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- Runs the existing JUnit 4 suite together with JUnit Jupiter on the JUnit Platform. -->
+    <dependency>
+      <groupId>org.junit.vintage</groupId>
+      <artifactId>junit-vintage-engine</artifactId>
       <version>5.7.1</version>
       <scope>test</scope>
     </dependency>
@@ -257,19 +265,11 @@
         </executions>
       </plugin>
 
-      <!-- Runs unit tests -->
-      <!-- Runs unit tests during the test phase using JUnit (including JUnit 4.7+ via surefire-junit47).-->
+      <!-- Runs JUnit Jupiter and JUnit 4 (through the Vintage engine) on the JUnit Platform. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.0.0-M4</version>
-        <dependencies>
-          <dependency>
-            <groupId>org.apache.maven.surefire</groupId>
-            <artifactId>surefire-junit47</artifactId>
-            <version>3.0.0-M4</version>
-          </dependency>
-        </dependencies>
       </plugin>
 
       <!-- Runs integration tests-->

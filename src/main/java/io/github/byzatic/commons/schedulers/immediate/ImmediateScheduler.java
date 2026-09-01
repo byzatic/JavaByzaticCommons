@@ -1,297 +1,236 @@
 package io.github.byzatic.commons.schedulers.immediate;
 
+import io.github.byzatic.commons.schedulers.unified.RunHandle;
+import io.github.byzatic.commons.schedulers.unified.RunOutcome;
+import io.github.byzatic.commons.schedulers.unified.RunState;
+import io.github.byzatic.commons.schedulers.unified.ScheduleEventListener;
+import io.github.byzatic.commons.schedulers.unified.ShutdownPolicy;
+import io.github.byzatic.commons.schedulers.unified.UnifiedScheduler;
+import io.github.byzatic.commons.schedulers.unified.UnifiedSchedulerInterface;
+
 import java.time.Duration;
 import java.time.Instant;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
 
-/**
- * ImmediateScheduler — a simple scheduler without cron:
- * - Add a task — it starts immediately.
- * - Supports soft-cancel via CancellationToken and termination on timeout.
- * - Events: start/complete/error/timeout/cancelled.
- * - Configurable ThreadPoolExecutor via Builder.
- */
+/** Legacy immediate-scheduler facade backed by {@link UnifiedScheduler}. */
 public final class ImmediateScheduler implements ImmediateSchedulerInterface {
-    private final ThreadPoolExecutor executor;
-    private final long defaultGraceMillis;
-    private final List<JobEventListener> listeners;
+    private final UnifiedSchedulerInterface delegate;
+    private final Duration defaultGrace;
+    private final CopyOnWriteArrayList<JobEventListener> listeners;
+    private final ConcurrentMap<UUID, LegacyRecord> jobs = new ConcurrentHashMap<>();
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final Object lifecycleLock = new Object();
+    private final boolean ownsDelegate;
+    private final LegacyEventBridge eventBridge;
 
-    private final Map<UUID, JobRecord> jobs = new ConcurrentHashMap<>();
-    private final AtomicBoolean closing = new AtomicBoolean(false);
-
-    private ImmediateScheduler(ThreadPoolExecutor executor, long defaultGraceMillis, List<JobEventListener> listeners) {
-        this.executor = executor;
-        this.defaultGraceMillis = defaultGraceMillis;
+    private ImmediateScheduler(UnifiedSchedulerInterface delegate, Duration defaultGrace,
+                               List<JobEventListener> listeners, boolean ownsDelegate) {
+        this.delegate = delegate;
+        this.defaultGrace = defaultGrace;
         this.listeners = new CopyOnWriteArrayList<>(listeners);
+        this.ownsDelegate = ownsDelegate;
+        this.eventBridge = new LegacyEventBridge();
+        delegate.addListener(eventBridge);
     }
 
     public static final class Builder {
         private ThreadPoolExecutor executor;
-        private long defaultGraceMillis = 10_000; // 10s
-        private final List<JobEventListener> listeners = new CopyOnWriteArrayList<>();
+        private Duration defaultGrace = Duration.ofSeconds(10);
+        private final List<JobEventListener> listeners = new ArrayList<>();
 
-        /**
-         * Provide your own custom thread pool.
-         */
-        public Builder executor(ThreadPoolExecutor executor) {
-            this.executor = executor;
-            return this;
-        }
-
-        /**
-         * Default grace period for soft stop.
-         */
+        public Builder executor(ThreadPoolExecutor executor) { this.executor = Objects.requireNonNull(executor); return this; }
         public Builder defaultGrace(Duration grace) {
-            this.defaultGraceMillis = Objects.requireNonNull(grace).toMillis();
-            return this;
+            Objects.requireNonNull(grace, "grace");
+            if (grace.isNegative()) throw new IllegalArgumentException("grace must not be negative");
+            defaultGrace = grace; return this;
         }
-
-        public Builder addListener(JobEventListener l) {
-            listeners.add(Objects.requireNonNull(l));
-            return this;
-        }
-
+        public Builder addListener(JobEventListener listener) { listeners.add(Objects.requireNonNull(listener)); return this; }
         public ImmediateScheduler build() {
-            if (executor == null) {
-                executor = new ThreadPoolExecutor(
-                        Math.max(2, Runtime.getRuntime().availableProcessors()),
-                        Math.max(4, Runtime.getRuntime().availableProcessors() * 2),
-                        60, TimeUnit.SECONDS,
-                        new LinkedBlockingQueue<>(),
-                        r -> {
-                            Thread t = new Thread(r, "immediate-exec-" + UUID.randomUUID());
-                            t.setDaemon(false);
-                            t.setUncaughtExceptionHandler((th, ex) ->
-                                    System.err.println("[ImmediateScheduler] Uncaught in " + th.getName() + ": " + ex));
-                            return t;
-                        },
-                        new ThreadPoolExecutor.CallerRunsPolicy()
-                );
-                executor.allowCoreThreadTimeOut(true);
-            }
-            return new ImmediateScheduler(executor, defaultGraceMillis, listeners);
+            UnifiedScheduler.Builder builder = UnifiedScheduler.builder()
+                    .threadNamePrefix("immediate-exec")
+                    .shutdownPolicy(ShutdownPolicy.builder()
+                            .gracefulTimeout(defaultGrace).forcedTimeout(Duration.ofSeconds(5)).build());
+            if (executor != null) builder.executor(executor);
+            return new ImmediateScheduler(builder.build(), defaultGrace, listeners, true);
         }
     }
 
-    // ======== Public API ========
-
-    /**
-     * Register an event listener.
-     */
-    @Override
-    public void addListener(JobEventListener l) {
-        listeners.add(Objects.requireNonNull(l));
+    /** Creates a facade that does not own or close the supplied unified scheduler. */
+    public static ImmediateScheduler adapt(UnifiedSchedulerInterface scheduler) {
+        return new ImmediateScheduler(Objects.requireNonNull(scheduler, "scheduler"),
+                Duration.ofSeconds(10), List.of(), false);
     }
 
-    /**
-     * Remove an event listener.
-     */
-    @Override
-    public void removeListener(JobEventListener l) {
-        listeners.remove(l);
-    }
+    @Override public void addListener(JobEventListener listener) { listeners.add(Objects.requireNonNull(listener)); }
+    @Override public void removeListener(JobEventListener listener) { listeners.remove(listener); }
 
-    /**
-     * Add a task: it starts immediately. Returns the UUID.
-     */
     @Override
     public UUID addTask(Task task) {
-        Objects.requireNonNull(task);
-        UUID id = UUID.randomUUID();
-        JobRecord rec = new JobRecord(id, task);
-        jobs.put(id, rec);
-        submitRun(rec);
-        return id;
+        Objects.requireNonNull(task, "task");
+        RunHandle handle;
+        LegacyRecord record;
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            handle = delegate.submit(new io.github.byzatic.commons.schedulers.unified.ScheduledTask() {
+                @Override public void run(io.github.byzatic.commons.schedulers.unified.CancellationContext context) throws Exception {
+                    task.run(CancellationToken.adapt(context));
+                }
+                @Override public void onCancellationRequested() { task.onStopRequested(); }
+            });
+            record = new LegacyRecord(handle);
+            jobs.put(handle.id(), record);
+        }
+        record.catchUp(handle);
+        return handle.id();
     }
 
-    /**
-     * Soft stop command for the current run, followed by termination on timeout.
-     */
-    @Override
-    public void stopTask(UUID jobId, Duration grace) {
-        requestStop(jobId, "Stop requested by user", grace, false);
+    @Override public void stopTask(UUID jobId, Duration grace) {
+        LegacyRecord record = jobs.get(jobId);
+        if (record == null) return;
+        RunHandle handle = record.handle;
+        if (handle == null) return;
+        try { handle.cancel("Stop requested by user", requireGrace(grace)); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
     }
 
-    /**
-     * Remove a task: unschedules it and attempts to stop the current run with the default grace period.
-     */
-    @Override
-    public boolean removeTask(UUID jobId) {
-        return removeTask(jobId, Duration.ofMillis(defaultGraceMillis));
-    }
+    @Override public boolean removeTask(UUID jobId) { return removeTask(jobId, defaultGrace); }
 
     @Override
     public boolean removeTask(UUID jobId, Duration grace) {
-        JobRecord rec = jobs.get(jobId);
-        if (rec == null) return false;
-        rec.removed.set(true);
-        requestStop(jobId, "Removed", grace, true);
-        jobs.remove(jobId);
+        LegacyRecord record = jobs.get(jobId);
+        if (record == null) return false;
+        RunHandle handle = record.handle;
+        try { if (handle != null) handle.cancel("Removed", requireGrace(grace)); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        jobs.remove(jobId, record);
         return true;
     }
 
-    /**
-     * Get the state/diagnostics for a task.
-     */
-    @Override
-    public Optional<JobInfo> query(UUID jobId) {
-        JobRecord r = jobs.get(jobId);
-        if (r == null) return Optional.empty();
-        return Optional.of(new JobInfo(r.id, r.state, r.lastStart, r.lastEnd, r.lastError));
+    @Override public Optional<JobInfo> query(UUID jobId) {
+        LegacyRecord record = jobs.get(jobId);
+        return record == null ? Optional.empty() : Optional.of(record.snapshot());
     }
 
-    /**
-     * List all tasks.
-     */
-    @Override
-    public List<JobInfo> listTasks() {
-        List<JobInfo> out = new ArrayList<>();
-        for (JobRecord r : jobs.values()) out.add(new JobInfo(r.id, r.state, r.lastStart, r.lastEnd, r.lastError));
-        return out;
+    @Override public List<JobInfo> listTasks() {
+        List<JobInfo> result = new ArrayList<>();
+        for (LegacyRecord record : jobs.values()) result.add(record.snapshot());
+        return result;
     }
 
-    @Override
-    public void close() {
-        if (!closing.compareAndSet(false, true)) return;
-        // сначала мягко попросим остановиться все задачи
-        for (UUID id : new ArrayList<>(jobs.keySet())) {
-            try {
-                requestStop(id, "Scheduler closing", Duration.ofMillis(defaultGraceMillis), true);
-            } catch (Exception ignored) {
-            }
+    @Override public void close() {
+        List<LegacyRecord> records;
+        synchronized (lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) return;
+            delegate.removeListener(eventBridge);
+            records = new ArrayList<>(jobs.values());
         }
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-            }
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            executor.shutdownNow();
+        if (ownsDelegate) {
+            delegate.close();
+            return;
+        }
+        for (LegacyRecord record : records) {
+            RunHandle handle = record.handle;
+            if (handle == null) continue;
+            try { handle.cancel("Immediate facade closing", defaultGrace); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; }
+        }
+        jobs.clear();
+    }
+
+    private void ensureOpen() {
+        if (closed.get()) {
+            throw new RejectedExecutionException("Immediate scheduler facade is closed");
         }
     }
 
-    // ======== Internals ========
-
-    private void submitRun(JobRecord rec) {
-        CancellationToken token = new CancellationToken();
-        rec.tokenRef.set(token);
-
-        Runnable wrapper = () -> {
-            rec.lastStart = Instant.now();
-            rec.state = JobState.RUNNING;
-            fire(l -> l.onStart(rec.id));
-            try {
-                rec.task.run(token);
-
-                // Если во время ожидания grace произошёл timeout и мы уже выставили TIMEOUT,
-                // не перетираем его на CANCELLED/COMPLETED и не шлём вторичные события.
-                if (rec.state == JobState.TIMEOUT) {
-                    rec.lastEnd = Instant.now();
-                    return;
-                }
-
-                boolean cancelled = token.isStopRequested();
-                rec.state = cancelled ? JobState.CANCELLED : JobState.COMPLETED;
-                rec.lastEnd = Instant.now();
-                if (cancelled) {
-                    fire(l -> l.onCancelled(rec.id));
-                } else {
-                    fire(l -> l.onComplete(rec.id));
-                }
-
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-
-                if (rec.state != JobState.TIMEOUT) {
-                    rec.state = JobState.CANCELLED;
-                    rec.lastEnd = Instant.now();
-                    fire(l -> l.onCancelled(rec.id));
-                } else {
-                    rec.lastEnd = Instant.now(); // фиксируем конец при TIMEOUT
-                }
-
-            } catch (CancellationException ce) {
-                if (rec.state != JobState.TIMEOUT) {
-                    rec.state = JobState.CANCELLED;
-                    rec.lastEnd = Instant.now();
-                    fire(l -> l.onCancelled(rec.id));
-                } else {
-                    rec.lastEnd = Instant.now();
-                }
-
-            } catch (Throwable ex) {
-                // Ошибка важнее обычной отмены, но если уже TIMEOUT — оставляем TIMEOUT
-                if (rec.state != JobState.TIMEOUT) {
-                    rec.state = JobState.FAILED;
-                    rec.lastEnd = Instant.now();
-                    rec.lastError = String.valueOf(ex);
-                    fire(l -> l.onError(rec.id, ex));
-                } else {
-                    rec.lastEnd = Instant.now();
-                }
-
-            } finally {
-                rec.runningFuture = null;
-                rec.tokenRef.set(null);
-            }
-        };
-
-        Future<?> f = executor.submit(wrapper);
-        rec.runningFuture = f;
+    private Duration requireGrace(Duration grace) {
+        Objects.requireNonNull(grace, "grace");
+        if (grace.isNegative()) throw new IllegalArgumentException("grace must not be negative");
+        return grace;
     }
 
-    private void requestStop(UUID jobId, String reason, Duration grace, boolean markRemovedIfDone) {
-        JobRecord rec = jobs.get(jobId);
-        if (rec == null) return;
-
-        Future<?> f = rec.runningFuture;
-        CancellationToken token = rec.tokenRef.get();
-
-        if (f != null && !f.isDone()) {
-            try {
-                rec.task.onStopRequested();
-            } catch (Throwable ignored) {
-            }
-            if (token != null) token.requestStop(reason);
-
-            try {
-                f.get(Math.max(1, grace.toMillis()), TimeUnit.MILLISECONDS);
-                // Успели завершиться кооперативно: событие и финальный статус выставляет submitRun().
-                if (markRemovedIfDone) rec.state = JobState.CANCELLED;
-
-            } catch (TimeoutException te) {
-                // Единственная точка, где выставляем TIMEOUT и шлём onTimeout.
-                f.cancel(true); // interrupt
-                rec.state = JobState.TIMEOUT;
-                fire(l -> l.onTimeout(rec.id));
-
-            } catch (ExecutionException ee) {
-                rec.state = JobState.FAILED;
-                rec.lastEnd = Instant.now();
-                rec.lastError = String.valueOf(ee.getCause());
-                fire(l -> l.onError(rec.id, ee.getCause()));
-
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                rec.state = JobState.CANCELLED;
-                fire(l -> l.onCancelled(rec.id));
-            }
-        } else {
-            // не бежит
-            if (markRemovedIfDone) rec.state = JobState.CANCELLED;
+    private final class LegacyEventBridge implements ScheduleEventListener {
+        @Override public void onRunStart(UUID scheduleId, UUID runId) {
+            LegacyRecord record = jobs.get(runId);
+            if (record != null) record.fireStart();
+        }
+        @Override public void onRunComplete(UUID scheduleId, RunOutcome outcome) {
+            LegacyRecord record = jobs.get(outcome.runId());
+            if (record != null) record.accept(outcome);
         }
     }
 
-    private void fire(Consumer<JobEventListener> c) {
-        for (JobEventListener l : listeners) {
-            try {
-                c.accept(l);
-            } catch (Throwable ignored) {
+    private final class LegacyRecord {
+        private final UUID id;
+        private volatile RunHandle handle;
+        private final AtomicBoolean startSent = new AtomicBoolean(false);
+        private final CompletableFuture<Void> startPublished = new CompletableFuture<>();
+        private final AtomicBoolean terminalSent = new AtomicBoolean(false);
+        private volatile JobState state = JobState.SCHEDULED;
+        private volatile Instant start;
+        private volatile Instant end;
+        private volatile String error;
+
+        private LegacyRecord(RunHandle handle) { this.id = handle.id(); this.handle = handle; }
+        private void catchUp(RunHandle current) {
+            if (current.state() != RunState.WAITING && current.state() != RunState.QUEUED) fireStart();
+            current.completion().thenAccept(this::accept);
+        }
+        private void fireStart() {
+            if (startSent.compareAndSet(false, true)) {
+                try {
+                    start = Instant.now();
+                    state = JobState.RUNNING;
+                    fire(listener -> listener.onStart(id));
+                } finally {
+                    startPublished.complete(null);
+                }
+                return;
             }
+            startPublished.join();
+        }
+        private void accept(RunOutcome outcome) {
+            fireStart();
+            if (!terminalSent.compareAndSet(false, true)) return;
+            outcome.startedAt().ifPresent(value -> start = value);
+            end = outcome.completedAt();
+            error = outcome.failure().map(String::valueOf).orElse(null);
+            state = map(outcome.state());
+            handle = null;
+            if (state == JobState.COMPLETED) fire(listener -> listener.onComplete(id));
+            else if (state == JobState.FAILED) fire(listener -> listener.onError(id, outcome.failure().orElse(null)));
+            else if (state == JobState.TIMEOUT) fire(listener -> listener.onTimeout(id));
+            else if (state == JobState.CANCELLED) fire(listener -> listener.onCancelled(id));
+        }
+        private JobInfo snapshot() { return new JobInfo(id, state, start, end, error); }
+    }
+
+    private static JobState map(RunState state) {
+        switch (state) {
+            case WAITING: case QUEUED: return JobState.SCHEDULED;
+            case RUNNING: return JobState.RUNNING;
+            case COMPLETED: return JobState.COMPLETED;
+            case FAILED: case REJECTED: return JobState.FAILED;
+            case TIMED_OUT: return JobState.TIMEOUT;
+            default: return JobState.CANCELLED;
+        }
+    }
+
+    private void fire(java.util.function.Consumer<JobEventListener> event) {
+        if (closed.get()) return;
+        for (JobEventListener listener : listeners) {
+            try { event.accept(listener); } catch (Throwable ignored) { }
         }
     }
 }

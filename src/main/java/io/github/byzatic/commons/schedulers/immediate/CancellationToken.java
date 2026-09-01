@@ -1,5 +1,7 @@
 package io.github.byzatic.commons.schedulers.immediate;
 
+import io.github.byzatic.commons.schedulers.unified.CancellationContext;
+
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -7,17 +9,33 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class CancellationToken {
     private final AtomicBoolean stop = new AtomicBoolean(false);
+    private final CancellationContext delegate;
     private volatile String reason = "";
 
+    CancellationToken() {
+        this.delegate = null;
+    }
+
+    private CancellationToken(CancellationContext delegate) {
+        this.delegate = delegate;
+    }
+
+    static CancellationToken adapt(CancellationContext delegate) {
+        return new CancellationToken(delegate);
+    }
+
     public boolean isStopRequested() {
-        return stop.get();
+        return delegate == null ? stop.get() : delegate.isCancellationRequested();
     }
 
     public String reason() {
-        return reason;
+        return delegate == null ? reason : delegate.reason();
     }
 
     void requestStop(String reason) {
+        if (delegate != null) {
+            throw new UnsupportedOperationException("Adapted token is controlled by UnifiedScheduler");
+        }
         this.reason = reason;
         stop.set(true);
     }
@@ -26,6 +44,6 @@ public final class CancellationToken {
      * Helper: throws InterruptedException if a stop has been requested.
      */
     public void throwIfStopRequested() throws InterruptedException {
-        if (isStopRequested()) throw new InterruptedException("Stop requested: " + reason);
+        if (isStopRequested()) throw new InterruptedException("Stop requested: " + reason());
     }
 }

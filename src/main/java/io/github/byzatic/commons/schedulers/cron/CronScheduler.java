@@ -1,402 +1,280 @@
 package io.github.byzatic.commons.schedulers.cron;
 
+import io.github.byzatic.commons.schedulers.unified.CronSchedule;
+import io.github.byzatic.commons.schedulers.unified.FailurePolicy;
+import io.github.byzatic.commons.schedulers.unified.MisfirePolicy;
+import io.github.byzatic.commons.schedulers.unified.OverlapPolicy;
+import io.github.byzatic.commons.schedulers.unified.RunHandle;
+import io.github.byzatic.commons.schedulers.unified.RunOutcome;
+import io.github.byzatic.commons.schedulers.unified.RunState;
+import io.github.byzatic.commons.schedulers.unified.ScheduleEventListener;
+import io.github.byzatic.commons.schedulers.unified.ScheduleHandle;
+import io.github.byzatic.commons.schedulers.unified.ScheduleOptions;
+import io.github.byzatic.commons.schedulers.unified.Schedules;
+import io.github.byzatic.commons.schedulers.unified.ShutdownPolicy;
+import io.github.byzatic.commons.schedulers.unified.UnifiedScheduler;
+import io.github.byzatic.commons.schedulers.unified.UnifiedSchedulerInterface;
+
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
 
-/**
- * CronScheduler
- * - Scheduling via cron (5 or 6 fields: [sec] min hour dom mon dow)
- * - Configurable ThreadPoolExecutor
- * - Add/remove tasks at runtime
- * - Soft task stop via CancellationToken + termination on timeout
- * - Event subscription (start/complete/error/timeout/cancelled)
- * - Prevent parallel execution of the same task (disallowOverlap)
- */
+/** Legacy cron-scheduler facade backed by {@link UnifiedScheduler}. */
 public final class CronScheduler implements CronSchedulerInterface {
-    private final ThreadPoolExecutor executor;
+    private final UnifiedSchedulerInterface delegate;
     private final ZoneId zone;
-    private final long defaultGraceMillis;
-    private final List<JobEventListener> listeners;
-    private final DelayQueue<ScheduledEntry> queue = new DelayQueue<>();
-    private final Map<UUID, JobRecord> jobs = new ConcurrentHashMap<>();
-    private final Thread dispatcher;
-    private final AtomicBoolean running = new AtomicBoolean(true);
+    private final Duration defaultGrace;
+    private final CopyOnWriteArrayList<JobEventListener> listeners;
+    private final ConcurrentMap<UUID, LegacyCronJob> jobs = new ConcurrentHashMap<>();
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final Object lifecycleLock = new Object();
+    private final boolean ownsDelegate;
+    private final LegacyEventBridge eventBridge;
 
-    public CronScheduler(ThreadPoolExecutor executor, ZoneId zone, long defaultGraceMillis, List<JobEventListener> listeners) {
-        this.executor = executor;
-        this.zone = zone;
-        this.defaultGraceMillis = defaultGraceMillis;
+    public CronScheduler(ThreadPoolExecutor executor, ZoneId zone, long defaultGraceMillis,
+                         List<JobEventListener> listeners) {
+        this(createDelegate(Objects.requireNonNull(executor), Duration.ofMillis(defaultGraceMillis)),
+                zone, Duration.ofMillis(defaultGraceMillis), listeners, true);
+    }
+
+    private CronScheduler(UnifiedSchedulerInterface delegate, ZoneId zone, Duration defaultGrace,
+                          List<JobEventListener> listeners, boolean ownsDelegate) {
+        this.delegate = Objects.requireNonNull(delegate, "delegate");
+        this.zone = Objects.requireNonNull(zone, "zone");
+        this.defaultGrace = requireGrace(defaultGrace);
         this.listeners = new CopyOnWriteArrayList<>(listeners);
-
-        this.dispatcher = new Thread(this::dispatchLoop, "cron-dispatcher");
-        this.dispatcher.setDaemon(true);
-        this.dispatcher.start();
+        this.ownsDelegate = ownsDelegate;
+        this.eventBridge = new LegacyEventBridge();
+        delegate.addListener(eventBridge);
     }
 
     public static final class Builder {
         private ThreadPoolExecutor executor;
         private ZoneId zone = ZoneId.systemDefault();
-        private long defaultGraceMillis = 10_000; // 10s
-        private final List<JobEventListener> listeners = new CopyOnWriteArrayList<>();
+        private Duration defaultGrace = Duration.ofSeconds(10);
+        private final List<JobEventListener> listeners = new ArrayList<>();
 
-        /**
-         * Provide your own custom thread pool.
-         */
-        public Builder executor(ThreadPoolExecutor executor) {
-            this.executor = executor;
-            return this;
-        }
-
-        public Builder zone(ZoneId zone) {
-            this.zone = Objects.requireNonNull(zone);
-            return this;
-        }
-
-        /**
-         * Default grace period when stopping tasks.
-         */
-        public Builder defaultGrace(Duration grace) {
-            this.defaultGraceMillis = Objects.requireNonNull(grace).toMillis();
-            return this;
-        }
-
-        public Builder addListener(JobEventListener l) {
-            listeners.add(l);
-            return this;
-        }
-
+        public Builder executor(ThreadPoolExecutor executor) { this.executor = Objects.requireNonNull(executor); return this; }
+        public Builder zone(ZoneId zone) { this.zone = Objects.requireNonNull(zone); return this; }
+        public Builder defaultGrace(Duration grace) { this.defaultGrace = requireGrace(grace); return this; }
+        public Builder addListener(JobEventListener listener) { listeners.add(Objects.requireNonNull(listener)); return this; }
         public CronScheduler build() {
-            if (executor == null) {
-                // дефолтный пул если не задан
-                executor = new ThreadPoolExecutor(
-                        Math.max(2, Runtime.getRuntime().availableProcessors()),
-                        Math.max(4, Runtime.getRuntime().availableProcessors() * 2),
-                        60, TimeUnit.SECONDS,
-                        new LinkedBlockingQueue<>(),
-                        r -> {
-                            Thread t = new Thread(r, "cron-exec-" + UUID.randomUUID());
-                            t.setDaemon(false);
-                            t.setUncaughtExceptionHandler((th, ex) ->
-                                    System.err.println("[CronScheduler] Uncaught in " + th.getName() + ": " + ex));
-                            return t;
-                        },
-                        new ThreadPoolExecutor.CallerRunsPolicy()
-                );
-                executor.allowCoreThreadTimeOut(true);
-            }
-            return new CronScheduler(executor, zone, defaultGraceMillis, listeners);
+            UnifiedScheduler.Builder builder = UnifiedScheduler.builder()
+                    .threadNamePrefix("cron-exec")
+                    .timerThreadName("cron-dispatcher")
+                    .shutdownPolicy(ShutdownPolicy.builder()
+                            .gracefulTimeout(defaultGrace).forcedTimeout(Duration.ofSeconds(5)).build());
+            if (executor != null) builder.executor(executor);
+            return new CronScheduler(builder.build(), zone, defaultGrace, listeners, true);
         }
     }
 
-    // ======== Public API ========
-
-    /**
-     * Register an event listener.
-     */
-    @Override
-    public void addListener(JobEventListener l) {
-        listeners.add(Objects.requireNonNull(l));
+    /** Creates a facade that does not own or close the supplied unified scheduler. */
+    public static CronScheduler adapt(UnifiedSchedulerInterface scheduler, ZoneId zone,
+                                      Duration defaultGrace) {
+        return new CronScheduler(Objects.requireNonNull(scheduler, "scheduler"), zone,
+                defaultGrace, List.of(), false);
     }
 
-    @Override
-    public void removeListener(JobEventListener l) {
-        listeners.remove(l);
-    }
+    @Override public void addListener(JobEventListener listener) { listeners.add(Objects.requireNonNull(listener)); }
+    @Override public void removeListener(JobEventListener listener) { listeners.remove(listener); }
 
-    /**
-     * Add a task with a cron schedule and optionally start it immediately.
-     */
     @Override
     public UUID addJob(String cron, CronTask task, boolean disallowOverlap, boolean runImmediately) {
-        Objects.requireNonNull(cron);
-        Objects.requireNonNull(task);
-        CronExpr expr = CronExpr.parse(cron);
-        UUID id = UUID.randomUUID();
-        JobRecord rec = new JobRecord(id, expr, task, zone, disallowOverlap);
-        jobs.put(id, rec);
-
-        long firstTrigger = runImmediately
-                ? System.currentTimeMillis()                       // запустить немедленно
-                : expr.next(Instant.now(), zone)                   // как раньше: ближайший по cron
-                .orElseThrow(() -> new IllegalArgumentException("Cron has no future fire time: " + cron))
-                .toEpochMilli();
-
-        queue.offer(new ScheduledEntry(id, firstTrigger));
-        return id;
+        Objects.requireNonNull(cron, "cron");
+        Objects.requireNonNull(task, "task");
+        CronSchedule cronSchedule = Schedules.cron(cron, zone, runImmediately);
+        ScheduleOptions options = ScheduleOptions.builder()
+                .overlapPolicy(disallowOverlap ? OverlapPolicy.SKIP : OverlapPolicy.ALLOW)
+                .misfirePolicy(MisfirePolicy.SKIP)
+                .failurePolicy(FailurePolicy.CONTINUE)
+                .cancellationGrace(defaultGrace)
+                .build();
+        ScheduleHandle handle;
+        LegacyCronJob record;
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            handle = delegate.schedule(new io.github.byzatic.commons.schedulers.unified.ScheduledTask() {
+                @Override public void run(io.github.byzatic.commons.schedulers.unified.CancellationContext context) throws Exception {
+                    task.run(CancellationToken.adapt(context));
+                }
+                @Override public void onCancellationRequested() { task.onStopRequested(); }
+            }, cronSchedule, options);
+            record = new LegacyCronJob(handle, cron);
+            jobs.put(handle.id(), record);
+        }
+        record.catchUp();
+        return handle.id();
     }
 
-    /**
-     * Add a task with a cron schedule. Returns the job's UUID.
-     */
-    @Override
-    public UUID addJob(String cron, CronTask task) {
-        return addJob(cron, task, false, true);    // без overlap, НО старт сразу
+    @Override public UUID addJob(String cron, CronTask task) { return addJob(cron, task, false, true); }
+    @Override public UUID addJob(String cron, CronTask task, boolean disallowOverlap) {
+        return addJob(cron, task, disallowOverlap, true);
     }
-
-    /**
-     * Add a task with a cron schedule and an option to prevent parallel executions.
-     */
-    @Override
-    public UUID addJob(String cron, CronTask task, boolean disallowOverlap) {
-        return addJob(cron, task, disallowOverlap, true); // старт сразу
-    }
-
-    /**
-     * Remove a task: unschedules it and attempts to stop the current run with the default grace period.
-     */
-    @Override
-    public boolean removeJob(UUID jobId) {
-        return removeJob(jobId, Duration.ofMillis(defaultGraceMillis));
-    }
+    @Override public boolean removeJob(UUID jobId) { return removeJob(jobId, defaultGrace); }
 
     @Override
     public boolean removeJob(UUID jobId, Duration grace) {
-        JobRecord rec = jobs.get(jobId);
-        if (rec == null) return false;
-        rec.removed.set(true);
-        requestStop(jobId, "Removed", grace, true);
-        jobs.remove(jobId);
+        LegacyCronJob record = jobs.get(jobId);
+        if (record == null) return false;
+        try { record.handle.cancel(requireGrace(grace)); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        jobs.remove(jobId, record);
         return true;
     }
 
-    /**
-     * Soft stop command for the current run, followed by termination on timeout.
-     */
     @Override
     public void stopJob(UUID jobId, Duration grace) {
-        requestStop(jobId, "Stop requested by user", grace, false);
+        LegacyCronJob record = jobs.get(jobId);
+        if (record == null) return;
+        try { record.handle.stopActiveRuns(requireGrace(grace)); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
     }
 
-    /**
-     * Get the state/diagnostics for a task.
-     */
-    @Override
-    public Optional<JobInfo> query(UUID jobId) {
-        JobRecord r = jobs.get(jobId);
-        if (r == null) return Optional.empty();
-        return Optional.of(new JobInfo(r.id, r.cron.toString(), r.state, r.lastStart, r.lastEnd, r.lastError));
+    @Override public Optional<JobInfo> query(UUID jobId) {
+        LegacyCronJob record = jobs.get(jobId);
+        return record == null ? Optional.empty() : Optional.of(record.snapshot());
     }
 
-    /**
-     * List all tasks.
-     */
-    @Override
-    public List<JobInfo> listJobs() {
-        List<JobInfo> out = new ArrayList<>();
-        for (JobRecord r : jobs.values()) {
-            out.add(new JobInfo(r.id, r.cron.toString(), r.state, r.lastStart, r.lastEnd, r.lastError));
+    @Override public List<JobInfo> listJobs() {
+        List<JobInfo> result = new ArrayList<>();
+        for (LegacyCronJob record : jobs.values()) result.add(record.snapshot());
+        return result;
+    }
+
+    @Override public void close() {
+        List<LegacyCronJob> records;
+        synchronized (lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) return;
+            delegate.removeListener(eventBridge);
+            records = new ArrayList<>(jobs.values());
         }
-        return out;
+        if (ownsDelegate) {
+            delegate.close();
+            return;
+        }
+        for (LegacyCronJob record : records) {
+            try { record.handle.cancel(defaultGrace); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; }
+        }
+        jobs.clear();
     }
 
-    @Override
-    public void close() {
-        running.set(false);
-        dispatcher.interrupt();
-        // Остановим все задачи мягко
-        for (UUID id : new ArrayList<>(jobs.keySet())) {
+    private void ensureOpen() {
+        if (closed.get()) {
+            throw new RejectedExecutionException("Cron scheduler facade is closed");
+        }
+    }
+
+    private final class LegacyEventBridge implements ScheduleEventListener {
+        @Override public void onRunStart(UUID scheduleId, UUID runId) {
+            LegacyCronJob record = jobs.get(scheduleId);
+            if (record != null) record.onStart(runId);
+        }
+        @Override public void onRunComplete(UUID scheduleId, RunOutcome outcome) {
+            LegacyCronJob record = jobs.get(scheduleId);
+            if (record != null) record.onOutcome(outcome);
+        }
+    }
+
+    private final class LegacyCronJob {
+        private final ScheduleHandle handle;
+        private final String cron;
+        private final ConcurrentMap<UUID, CompletableFuture<Void>> starts =
+                new ConcurrentHashMap<>();
+        private final Set<UUID> terminals = ConcurrentHashMap.newKeySet();
+        private final AtomicBoolean registrationComplete = new AtomicBoolean(false);
+        private volatile JobState state = JobState.SCHEDULED;
+        private volatile Instant lastStart;
+        private volatile Instant lastEnd;
+        private volatile String lastError;
+
+        private LegacyCronJob(ScheduleHandle handle, String cron) { this.handle = handle; this.cron = cron; }
+        private void catchUp() {
             try {
-                requestStop(id, "Scheduler closing", Duration.ofMillis(defaultGraceMillis), true);
-            } catch (Exception ignored) {
-            }
-        }
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-            }
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            executor.shutdownNow();
-        }
-    }
-
-    // ======== Internal ========
-
-    private void dispatchLoop() {
-        while (running.get()) {
-            try {
-                ScheduledEntry entry = queue.take(); // блокируется до наступления времени
-                JobRecord rec = jobs.get(entry.jobId);
-                if (rec == null || rec.removed.get()) continue;
-
-                // Если запрещены параллельные запуски и задача ещё бежит — пропускаем этот тик и перепланируем
-                if (rec.disallowOverlap && rec.isRunning.get()) {
-                    Instant nextIfSkipped = rec.cron.next(Instant.now(), rec.zone).orElse(null);
-                    if (nextIfSkipped != null && !rec.removed.get()) {
-                        queue.offer(new ScheduledEntry(rec.id, nextIfSkipped.toEpochMilli()));
-                    }
-                    continue;
-                }
-
-                // Планируем выполнение
-                submitRun(rec);
-
-                // Пере-планируем следующий запуск
-                Instant next = rec.cron.next(Instant.now(), rec.zone).orElse(null);
-                if (next != null && !rec.removed.get()) {
-                    queue.offer(new ScheduledEntry(rec.id, next.toEpochMilli()));
-                }
-            } catch (InterruptedException ie) {
-                if (!running.get()) break;
-            } catch (Throwable t) {
-                System.err.println("[CronScheduler] dispatcher error: " + t);
-            }
-        }
-    }
-
-    private void submitRun(JobRecord rec) {
-        if (rec.disallowOverlap && !rec.isRunning.compareAndSet(false, true)) return;
-
-        // сбрасываем флаги перед запуском
-        rec.timedOut.set(false);
-        rec.terminalEventSent.set(false);
-
-        CancellationToken token = new CancellationToken();
-        rec.tokenRef.set(token);
-
-        Runnable wrapper = () -> {
-            rec.lastStart = Instant.now();
-            rec.state = JobState.RUNNING;
-            fire(l -> l.onStart(rec.id));
-            try {
-                rec.task.run(token);
-
-                // если уже отметили TIMEOUT – фиксируем конец и выходим без вторичных событий
-                if (rec.timedOut.get() || rec.state == JobState.TIMEOUT) {
-                    rec.lastEnd = Instant.now();
-                    return;
-                }
-
-                boolean cancelled = token.isStopRequested();
-                rec.state = cancelled ? JobState.CANCELLED : JobState.COMPLETED;
-                rec.lastEnd = Instant.now();
-                if (cancelled) {
-                    fireCancelled(rec);
-                } else {
-                    fireComplete(rec);
-                }
-
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                if (rec.timedOut.get() || rec.state == JobState.TIMEOUT) {
-                    rec.lastEnd = Instant.now(); // уже TIMEOUT – только фиксируем конец
-                } else {
-                    rec.state = JobState.CANCELLED;
-                    rec.lastEnd = Instant.now();
-                    fireCancelled(rec);
-                }
-            } catch (CancellationException ce) {
-                if (rec.timedOut.get() || rec.state == JobState.TIMEOUT) {
-                    rec.lastEnd = Instant.now();
-                } else {
-                    rec.state = JobState.CANCELLED;
-                    rec.lastEnd = Instant.now();
-                    fireCancelled(rec);
-                }
-            } catch (Throwable ex) {
-                if (rec.timedOut.get() || rec.state == JobState.TIMEOUT) {
-                    rec.lastEnd = Instant.now();
-                } else {
-                    rec.state = JobState.FAILED;
-                    rec.lastEnd = Instant.now();
-                    rec.lastError = String.valueOf(ex);
-                    fireError(rec, ex);
-                }
+                for (RunHandle run : handle.activeRuns()) onStart(run.id());
+                handle.lastOutcome().ifPresent(this::onOutcome);
             } finally {
-                rec.runningFuture = null;
-                rec.tokenRef.set(null);
-                if (rec.disallowOverlap) rec.isRunning.set(false);
+                registrationComplete.set(true);
+                for (UUID terminalRun : terminals) starts.remove(terminalRun);
+                terminals.clear();
             }
-        };
-
-        Future<?> f = executor.submit(wrapper);
-        rec.runningFuture = f;
-    }
-
-    private void fire(Consumer<JobEventListener> c) {
-        for (JobEventListener l : listeners) {
+        }
+        private void onStart(UUID runId) {
+            CompletableFuture<Void> publication = new CompletableFuture<>();
+            CompletableFuture<Void> existing = starts.putIfAbsent(runId, publication);
+            if (existing != null) {
+                existing.join();
+                return;
+            }
             try {
-                c.accept(l);
-            } catch (Throwable ignored) {
+                lastStart = Instant.now();
+                state = JobState.RUNNING;
+                fire(listener -> listener.onStart(handle.id()));
+            } finally {
+                publication.complete(null);
             }
         }
-    }
-
-    private void requestStop(UUID jobId, String reason, Duration grace, boolean markRemovedIfDone) {
-        JobRecord rec = jobs.get(jobId);
-        if (rec == null) return;
-
-        Future<?> f = rec.runningFuture;
-        CancellationToken token = rec.tokenRef.get();
-
-        if (f != null && !f.isDone()) {
-            try { rec.task.onStopRequested(); } catch (Throwable ignored) {}
-            if (token != null) token.requestStop(reason);
-
-            try {
-                f.get(Math.max(1, grace.toMillis()), TimeUnit.MILLISECONDS);
-                // кооперативно завершилось: вторичные события/статус выставит submitRun()
-                if (markRemovedIfDone) rec.state = JobState.CANCELLED;
-
-            } catch (TimeoutException te) {
-                // помечаем таймаут ДО interrupt — чтобы раннер это увидел и не шлёт onCancelled/onComplete
-                rec.timedOut.set(true);
-                rec.state = JobState.TIMEOUT;
-                fireTimeout(rec);
-
-                // теперь прерываем поток задачи
-                f.cancel(true);
-
-            } catch (ExecutionException ee) {
-                rec.state = JobState.FAILED;
-                rec.lastEnd = Instant.now();
-                rec.lastError = String.valueOf(ee.getCause());
-                fireError(rec, ee.getCause());
-
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                // если уже TIMEOUT — ничего не перетираем и не шлём onCancelled
-                if (!rec.timedOut.get() && rec.state != JobState.TIMEOUT) {
-                    rec.state = JobState.CANCELLED;
-                    fireCancelled(rec);
-                }
+        private void onOutcome(RunOutcome outcome) {
+            onStart(outcome.runId());
+            if (!terminals.add(outcome.runId())) return;
+            outcome.startedAt().ifPresent(value -> lastStart = value);
+            lastEnd = outcome.completedAt();
+            lastError = outcome.failure().map(String::valueOf).orElse(null);
+            state = map(outcome.state());
+            if (state == JobState.COMPLETED) fire(listener -> listener.onComplete(handle.id()));
+            else if (state == JobState.FAILED) fire(listener -> listener.onError(handle.id(), outcome.failure().orElse(null)));
+            else if (state == JobState.TIMEOUT) fire(listener -> listener.onTimeout(handle.id()));
+            else if (state == JobState.CANCELLED) fire(listener -> listener.onCancelled(handle.id()));
+            if (registrationComplete.get()) {
+                terminals.remove(outcome.runId());
+                starts.remove(outcome.runId());
             }
-        } else {
-            // не бежит
-            if (markRemovedIfDone) rec.state = JobState.CANCELLED;
+        }
+        private JobInfo snapshot() { return new JobInfo(handle.id(), cron, state, lastStart, lastEnd, lastError); }
+    }
+
+    private static UnifiedSchedulerInterface createDelegate(ThreadPoolExecutor executor, Duration grace) {
+        return UnifiedScheduler.builder().executor(executor)
+                .shutdownPolicy(ShutdownPolicy.builder()
+                        .gracefulTimeout(grace).forcedTimeout(Duration.ofSeconds(5)).build())
+                .build();
+    }
+
+    private static Duration requireGrace(Duration grace) {
+        Objects.requireNonNull(grace, "grace");
+        if (grace.isNegative()) throw new IllegalArgumentException("grace must not be negative");
+        return grace;
+    }
+
+    private static JobState map(RunState state) {
+        switch (state) {
+            case WAITING: case QUEUED: return JobState.SCHEDULED;
+            case RUNNING: return JobState.RUNNING;
+            case COMPLETED: return JobState.COMPLETED;
+            case FAILED: case REJECTED: return JobState.FAILED;
+            case TIMED_OUT: return JobState.TIMEOUT;
+            default: return JobState.CANCELLED;
         }
     }
 
-    private void fireTimeout(JobRecord rec) {
-        if (rec.terminalEventSent.compareAndSet(false, true)) {
-            rec.state = JobState.TIMEOUT;
-            fire(l -> l.onTimeout(rec.id));
+    private void fire(java.util.function.Consumer<JobEventListener> event) {
+        if (closed.get()) return;
+        for (JobEventListener listener : listeners) {
+            try { event.accept(listener); } catch (Throwable ignored) { }
         }
     }
-
-    private void fireCancelled(JobRecord rec) {
-        if (rec.terminalEventSent.compareAndSet(false, true)) {
-            rec.state = JobState.CANCELLED;
-            fire(l -> l.onCancelled(rec.id));
-        }
-    }
-
-    private void fireComplete(JobRecord rec) {
-        if (rec.terminalEventSent.compareAndSet(false, true)) {
-            fire(l -> l.onComplete(rec.id));
-        }
-    }
-
-    private void fireError(JobRecord rec, Throwable ex) {
-        if (rec.terminalEventSent.compareAndSet(false, true)) {
-            fire(l -> l.onError(rec.id, ex));
-        }
-    }
-
 }

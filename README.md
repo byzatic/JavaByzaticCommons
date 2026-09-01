@@ -124,6 +124,31 @@ Destination dest = CustomConverter.parse(source, Destination.class);
 
 ---
 
+## UnifiedScheduler
+
+`UnifiedScheduler` is the common execution engine for immediate, delayed, fixed-delay,
+fixed-rate, and cron work. User tasks always execute on a configurable `ThreadPoolExecutor`.
+
+```java
+try (UnifiedScheduler scheduler = UnifiedScheduler.builder()
+        .singleThreaded()
+        .queueCapacity(1024)
+        .threadNamePrefix("project-reload")
+        .build()) {
+    RunHandle immediate = scheduler.submit(token -> reloadProject());
+    RunHandle delayed = scheduler.schedule(token -> checkStartup(), Duration.ofSeconds(30));
+    ScheduleHandle cron = scheduler.schedule(
+            token -> calculateGraph(),
+            Schedules.cron("0 */5 * * * *"),
+            ScheduleOptions.builder().overlapPolicy(OverlapPolicy.SKIP).build());
+}
+```
+
+The existing `ImmediateScheduler` and `CronScheduler` APIs remain available as compatibility
+facades backed by this engine. See **[Unified Scheduler](.docs/README-unified-scheduler.md)**.
+
+---
+
 ## CronScheduler (Quick Summary)
 
 A small cron-based scheduler for Java (5 or 6 fields, seconds supported).
