@@ -1,5 +1,13 @@
 package io.github.byzatic.commons.schedulers.unified;
 
+import io.github.byzatic.commons.schedulers.unified.internal.core.SchedulerRuntimeContext;
+import io.github.byzatic.commons.schedulers.unified.internal.execution.SchedulerRun;
+import io.github.byzatic.commons.schedulers.unified.internal.execution.SerialExecutionLane;
+import io.github.byzatic.commons.schedulers.unified.internal.executor.SchedulerExecutorFactory;
+import io.github.byzatic.commons.schedulers.unified.internal.executor.SchedulerThreadFactory;
+import io.github.byzatic.commons.schedulers.unified.internal.scheduling.SchedulerSchedule;
+import io.github.byzatic.commons.schedulers.unified.internal.timing.SchedulerTrigger;
+
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -9,29 +17,26 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.DelayQueue;
-import java.util.concurrent.Delayed;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Unified immediate, delayed, periodic and cron scheduler. All user tasks are executed by a
- * {@link ThreadPoolExecutor}; the timer dispatcher only transfers due work to that executor.
+ * Public composition root for immediate, delayed, periodic and cron execution.
+ *
+ * <p>Run, schedule, trigger and executor mechanics live in internal implementation modules. User
+ * work always executes on a {@link ThreadPoolExecutor}; the timer thread only dispatches due
+ * work.</p>
+ *
+ * <p>Instances are thread-safe. A supplied executor becomes owned by this scheduler.</p>
  */
 public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     private static final int MAX_TRIGGER_DISPATCH_BATCH = 1_024;
@@ -39,11 +44,11 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     private final ThreadPoolExecutor executor;
     private final Clock clock;
     private final ShutdownPolicy shutdownPolicy;
-    private final DelayQueue<TriggerEntry> triggers = new DelayQueue<>();
-    private final ConcurrentMap<UUID, ScheduleControl> schedules = new ConcurrentHashMap<>();
-    private final ConcurrentMap<UUID, RunControl> activeRuns = new ConcurrentHashMap<>();
+    private final DelayQueue<SchedulerTrigger> triggers = new DelayQueue<>();
+    private final ConcurrentMap<UUID, SchedulerSchedule> schedules = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, SchedulerRun> activeRuns = new ConcurrentHashMap<>();
     private final CopyOnWriteArrayList<ScheduleEventListener> listeners;
-    /** Linearizes new registrations with scheduler shutdown. */
+    private final SchedulerRuntimeContext runtimeContext = new RuntimeContext();
     private final Object lifecycleLock = new Object();
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final AtomicBoolean dispatcherRunning = new AtomicBoolean(true);
@@ -55,12 +60,22 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
         clock = builder.clock;
         shutdownPolicy = builder.shutdownPolicy;
         listeners = new CopyOnWriteArrayList<>(builder.listeners);
-        executor = builder.executor == null ? createExecutor(builder) : validateExecutor(builder.executor);
+        executor = builder.executor == null
+                ? SchedulerExecutorFactory.create(
+                        builder.parallelism,
+                        builder.queueCapacity,
+                        builder.keepAlive,
+                        builder.allowCoreThreadTimeout,
+                        builder.workerThreadFactory
+                )
+                : SchedulerExecutorFactory.validate(builder.executor);
         dispatcher = builder.timerThreadFactory.newThread(this::dispatchLoop);
         dispatcher.start();
     }
 
-    public static Builder builder() { return new Builder(); }
+    public static Builder builder() {
+        return new Builder();
+    }
 
     @Override
     public ExecutionLane serialLane(String name) {
@@ -73,7 +88,7 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     @Override
     public RunHandle submit(ScheduledTask task) {
         Objects.requireNonNull(task, "task");
-        RunControl run = new RunControl(null, task, RunState.QUEUED);
+        SchedulerRun run = new SchedulerRun(runtimeContext, null, task, RunState.QUEUED);
         submitRun(run, true);
         return run;
     }
@@ -88,14 +103,19 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     public RunHandle schedule(ScheduledTask task, Duration delay) {
         Objects.requireNonNull(task, "task");
         Duration validDelay = DelayedSchedule.requireNonNegative(delay, "delay");
-        if (validDelay.isZero()) return submit(task);
-        RunControl run = new RunControl(null, task, RunState.WAITING);
+        if (validDelay.isZero()) {
+            return submit(task);
+        }
+        SchedulerRun run = new SchedulerRun(runtimeContext, null, task, RunState.WAITING);
         synchronized (lifecycleLock) {
             ensureAccepting();
             activeRuns.put(run.id(), run);
-            TriggerEntry trigger = TriggerEntry.forRun(
-                    run, clock.instant().plus(validDelay), nextSequence());
-            run.pendingTrigger = trigger;
+            SchedulerTrigger trigger = SchedulerTrigger.forRun(
+                    run,
+                    clock.instant().plus(validDelay),
+                    nextTriggerSequence()
+            );
+            run.pendingTrigger(trigger);
             triggers.offer(trigger);
         }
         return run;
@@ -107,11 +127,15 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
     }
 
     @Override
-    public ScheduleHandle schedule(ScheduledTask task, Schedule schedule, ScheduleOptions options) {
+    public ScheduleHandle schedule(
+            ScheduledTask task,
+            Schedule schedule,
+            ScheduleOptions options
+    ) {
         Objects.requireNonNull(task, "task");
         Objects.requireNonNull(schedule, "schedule");
         Objects.requireNonNull(options, "options");
-        ScheduleControl control = new ScheduleControl(task, schedule, options);
+        SchedulerSchedule control = new SchedulerSchedule(runtimeContext, task, schedule, options);
         synchronized (lifecycleLock) {
             ensureAccepting();
             schedules.put(control.id(), control);
@@ -119,7 +143,7 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
                 control.scheduleInitial();
             } catch (RuntimeException failure) {
                 schedules.remove(control.id(), control);
-                control.state.set(ScheduleState.FAILED);
+                control.markRegistrationFailed();
                 throw failure;
             }
         }
@@ -136,18 +160,31 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
         return Collections.unmodifiableList(new ArrayList<ScheduleHandle>(schedules.values()));
     }
 
-    @Override public void addListener(ScheduleEventListener listener) { listeners.add(Objects.requireNonNull(listener)); }
-    @Override public void removeListener(ScheduleEventListener listener) { listeners.remove(listener); }
+    @Override
+    public void addListener(ScheduleEventListener listener) {
+        listeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    @Override
+    public void removeListener(ScheduleEventListener listener) {
+        listeners.remove(listener);
+    }
 
     @Override
     public void shutdown() {
         synchronized (lifecycleLock) {
-            if (!accepting.compareAndSet(true, false)) return;
+            if (!accepting.compareAndSet(true, false)) {
+                return;
+            }
         }
         stopDispatcher();
-        for (ScheduleControl schedule : schedules.values()) schedule.cancelFutureTriggers();
-        for (RunControl run : activeRuns.values()) {
-            if (run.state() == RunState.WAITING) run.cancelBeforeExecution("Scheduler shutdown");
+        for (SchedulerSchedule schedule : schedules.values()) {
+            schedule.cancelFutureTriggers();
+        }
+        for (SchedulerRun run : activeRuns.values()) {
+            if (run.state() == RunState.WAITING) {
+                run.cancelBeforeExecution("Scheduler shutdown");
+            }
         }
         executor.shutdown();
     }
@@ -158,13 +195,17 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
             accepting.set(false);
         }
         stopDispatcher();
-        for (ScheduleControl schedule : schedules.values()) schedule.cancelFutureTriggers();
-        for (RunControl run : activeRuns.values()) run.forceCancellation("Scheduler forced shutdown", false);
+        for (SchedulerSchedule schedule : schedules.values()) {
+            schedule.cancelFutureTriggers();
+        }
+        for (SchedulerRun run : activeRuns.values()) {
+            run.forceCancellation("Scheduler forced shutdown", false);
+        }
         List<Runnable> queued = executor.shutdownNow();
         List<RunHandle> notStarted = new ArrayList<>();
         for (Runnable runnable : queued) {
-            if (runnable instanceof RunControl) {
-                RunControl run = (RunControl) runnable;
+            if (runnable instanceof SchedulerRun) {
+                SchedulerRun run = (SchedulerRun) runnable;
                 run.cancelBeforeExecution("Scheduler forced shutdown");
                 notStarted.add(run);
             }
@@ -180,18 +221,29 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
         Duration valid = DelayedSchedule.requireNonNegative(timeout, "timeout");
         long deadline = System.nanoTime() + valid.toNanos();
         long dispatcherWait = Math.max(0L, deadline - System.nanoTime());
-        if (!dispatcherTerminated.await(dispatcherWait, TimeUnit.NANOSECONDS)) return false;
+        if (!dispatcherTerminated.await(dispatcherWait, TimeUnit.NANOSECONDS)) {
+            return false;
+        }
         long executorWait = Math.max(0L, deadline - System.nanoTime());
         return executor.awaitTermination(executorWait, TimeUnit.NANOSECONDS);
     }
 
-    @Override public boolean isShutdown() { return !accepting.get(); }
-    @Override public boolean isTerminated() { return dispatcherTerminated.getCount() == 0 && executor.isTerminated(); }
+    @Override
+    public boolean isShutdown() {
+        return !accepting.get();
+    }
+
+    @Override
+    public boolean isTerminated() {
+        return dispatcherTerminated.getCount() == 0 && executor.isTerminated();
+    }
 
     @Override
     public void close() {
         shutdown();
-        for (RunControl run : activeRuns.values()) run.requestCancellation("Scheduler closing");
+        for (SchedulerRun run : activeRuns.values()) {
+            run.requestCancellation("Scheduler closing");
+        }
         if (isCurrentWorkerThread()) {
             shutdownNow();
             return;
@@ -207,53 +259,43 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
         }
     }
 
-    private void ensureAccepting() {
-        if (!accepting.get()) throw new RejectedExecutionException("Scheduler is shut down");
+    private Instant now() {
+        return clock.instant();
     }
 
-    private void dispatchLoop() {
-        List<TriggerEntry> dueTriggers = new ArrayList<>(MAX_TRIGGER_DISPATCH_BATCH);
-        try {
-            while (dispatcherRunning.get()) {
-                try {
-                    TriggerEntry trigger = triggers.take();
-                    dispatchTriggerSafely(trigger);
-                    triggers.drainTo(dueTriggers, MAX_TRIGGER_DISPATCH_BATCH);
-                    for (TriggerEntry dueTrigger : dueTriggers) {
-                        if (!dispatcherRunning.get()) break;
-                        dispatchTriggerSafely(dueTrigger);
-                    }
-                } catch (InterruptedException interrupted) {
-                    if (!dispatcherRunning.get()) break;
-                } finally {
-                    dueTriggers.clear();
-                }
-            }
-        } finally {
-            dispatcherTerminated.countDown();
-        }
+    private boolean isAccepting() {
+        return accepting.get();
     }
 
-    private void dispatchTriggerSafely(TriggerEntry trigger) {
-        try {
-            if (trigger.run != null) dispatchDelayedRun(trigger.run);
-            else if (trigger.schedule != null) trigger.schedule.onTrigger(trigger);
-        } catch (Throwable ignored) {
-            // A malformed schedule must not terminate timing for unrelated schedules.
-        }
+    private long nextTriggerSequence() {
+        return triggerSequence.incrementAndGet();
     }
 
-    private void dispatchDelayedRun(RunControl run) {
-        run.pendingTrigger = null;
-        if (!accepting.get()) {
-            run.cancelBeforeExecution("Scheduler shutdown before delayed execution");
-            return;
-        }
-        if (!run.state.compareAndSet(RunState.WAITING, RunState.QUEUED)) return;
-        submitRun(run, false);
+    private void offerTrigger(SchedulerTrigger trigger) {
+        triggers.offer(trigger);
     }
 
-    private void submitRun(RunControl run, boolean propagateRejection) {
+    private void removeTrigger(SchedulerTrigger trigger) {
+        triggers.remove(trigger);
+    }
+
+    private void removeTriggers(SchedulerSchedule schedule) {
+        triggers.removeIf(trigger -> trigger.schedule() == schedule);
+    }
+
+    private void removeQueuedRun(SchedulerRun run) {
+        executor.remove(run);
+    }
+
+    private void removeSchedule(UUID id, SchedulerSchedule schedule) {
+        schedules.remove(id, schedule);
+    }
+
+    private void onRunExited(SchedulerRun run) {
+        activeRuns.remove(run.id(), run);
+    }
+
+    private void submitRun(SchedulerRun run, boolean propagateRejection) {
         RejectedExecutionException lifecycleRejection = null;
         synchronized (lifecycleLock) {
             if (!accepting.get()) {
@@ -266,34 +308,123 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
         }
         if (lifecycleRejection != null) {
             run.reject(lifecycleRejection);
-            if (propagateRejection) throw lifecycleRejection;
+            if (propagateRejection) {
+                throw lifecycleRejection;
+            }
             return;
         }
         try {
             executor.execute(run);
         } catch (RejectedExecutionException rejection) {
             run.reject(rejection);
-            if (propagateRejection) throw rejection;
+            if (propagateRejection) {
+                throw rejection;
+            }
         }
     }
 
-    private long nextSequence() { return triggerSequence.incrementAndGet(); }
+    private void fireStart(UUID scheduleId, UUID runId) {
+        for (ScheduleEventListener listener : listeners) {
+            try {
+                listener.onRunStart(scheduleId, runId);
+            } catch (Throwable ignored) {
+                // Listener failures cannot change scheduler state.
+            }
+        }
+    }
 
-    private static UUID newIdentifier() {
-        // Scheduler identifiers are correlation keys, not security tokens. Thread-local random
-        // generation avoids the SecureRandom contention and digest allocation of UUID.randomUUID().
-        ThreadLocalRandom random = ThreadLocalRandom.current();
-        long mostSignificantBits = random.nextLong();
-        long leastSignificantBits = random.nextLong();
-        mostSignificantBits = (mostSignificantBits & 0xffffffffffff0fffL) | 0x0000000000004000L;
-        leastSignificantBits = (leastSignificantBits & 0x3fffffffffffffffL) | 0x8000000000000000L;
-        return new UUID(mostSignificantBits, leastSignificantBits);
+    private void fireOutcome(UUID scheduleId, RunOutcome outcome) {
+        for (ScheduleEventListener listener : listeners) {
+            try {
+                listener.onRunComplete(scheduleId, outcome);
+            } catch (Throwable ignored) {
+                // Listener failures cannot change scheduler state.
+            }
+        }
+    }
+
+    private void fireRejected(UUID scheduleId, UUID runId, Throwable failure) {
+        for (ScheduleEventListener listener : listeners) {
+            try {
+                listener.onRunRejected(scheduleId, runId, failure);
+            } catch (Throwable ignored) {
+                // Listener failures cannot change scheduler state.
+            }
+        }
+    }
+
+    private void fireSkipped(UUID scheduleId) {
+        for (ScheduleEventListener listener : listeners) {
+            try {
+                listener.onRunSkipped(scheduleId);
+            } catch (Throwable ignored) {
+                // Listener failures cannot change scheduler state.
+            }
+        }
+    }
+
+    private void ensureAccepting() {
+        if (!accepting.get()) {
+            throw new RejectedExecutionException("Scheduler is shut down");
+        }
+    }
+
+    private void dispatchLoop() {
+        List<SchedulerTrigger> dueTriggers = new ArrayList<>(MAX_TRIGGER_DISPATCH_BATCH);
+        try {
+            while (dispatcherRunning.get()) {
+                try {
+                    SchedulerTrigger trigger = triggers.take();
+                    dispatchTriggerSafely(trigger);
+                    triggers.drainTo(dueTriggers, MAX_TRIGGER_DISPATCH_BATCH);
+                    for (SchedulerTrigger dueTrigger : dueTriggers) {
+                        if (!dispatcherRunning.get()) {
+                            break;
+                        }
+                        dispatchTriggerSafely(dueTrigger);
+                    }
+                } catch (InterruptedException interrupted) {
+                    if (!dispatcherRunning.get()) {
+                        break;
+                    }
+                } finally {
+                    dueTriggers.clear();
+                }
+            }
+        } finally {
+            dispatcherTerminated.countDown();
+        }
+    }
+
+    private void dispatchTriggerSafely(SchedulerTrigger trigger) {
+        try {
+            if (trigger.run() != null) {
+                dispatchDelayedRun(trigger.run());
+            } else if (trigger.schedule() != null) {
+                trigger.schedule().onTrigger(trigger);
+            }
+        } catch (Throwable ignored) {
+            // A malformed schedule must not terminate timing for unrelated schedules.
+        }
+    }
+
+    private void dispatchDelayedRun(SchedulerRun run) {
+        if (!accepting.get()) {
+            run.cancelBeforeExecution("Scheduler shutdown before delayed execution");
+            return;
+        }
+        if (!run.prepareDelayedDispatch()) {
+            return;
+        }
+        submitRun(run, false);
     }
 
     private boolean isCurrentWorkerThread() {
         Thread current = Thread.currentThread();
-        for (RunControl run : activeRuns.values()) {
-            if (run.runner == current) return true;
+        for (SchedulerRun run : activeRuns.values()) {
+            if (run.isRunningOn(current)) {
+                return true;
+            }
         }
         return false;
     }
@@ -305,448 +436,89 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
         }
     }
 
-    private void fireStart(UUID scheduleId, UUID runId) {
-        for (ScheduleEventListener listener : listeners) {
-            try { listener.onRunStart(scheduleId, runId); } catch (Throwable ignored) { }
+    private final class RuntimeContext implements SchedulerRuntimeContext {
+        @Override
+        public Instant now() {
+            return UnifiedScheduler.this.now();
         }
-    }
-
-    private void fireOutcome(UUID scheduleId, RunOutcome outcome) {
-        for (ScheduleEventListener listener : listeners) {
-            try { listener.onRunComplete(scheduleId, outcome); } catch (Throwable ignored) { }
-        }
-    }
-
-    private void fireRejected(UUID scheduleId, UUID runId, Throwable failure) {
-        for (ScheduleEventListener listener : listeners) {
-            try { listener.onRunRejected(scheduleId, runId, failure); } catch (Throwable ignored) { }
-        }
-    }
-
-    private void fireSkipped(UUID scheduleId) {
-        for (ScheduleEventListener listener : listeners) {
-            try { listener.onRunSkipped(scheduleId); } catch (Throwable ignored) { }
-        }
-    }
-
-    private static ThreadPoolExecutor createExecutor(Builder builder) {
-        ThreadPoolExecutor result = new ThreadPoolExecutor(
-                builder.parallelism, builder.parallelism,
-                builder.keepAlive.toMillis(), TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(builder.queueCapacity),
-                builder.workerThreadFactory,
-                new ThreadPoolExecutor.AbortPolicy());
-        result.allowCoreThreadTimeOut(builder.allowCoreThreadTimeout);
-        return result;
-    }
-
-    private static ThreadPoolExecutor validateExecutor(ThreadPoolExecutor executor) {
-        Objects.requireNonNull(executor, "executor");
-        if (executor.isShutdown()) throw new IllegalArgumentException("executor is already shut down");
-        if (!(executor.getRejectedExecutionHandler() instanceof ThreadPoolExecutor.AbortPolicy)) {
-            throw new IllegalArgumentException("executor must use ThreadPoolExecutor.AbortPolicy");
-        }
-        return executor;
-    }
-
-    private final class RunControl implements RunHandle, Runnable {
-        private final UUID id = newIdentifier();
-        private final ScheduleControl owner;
-        private final ScheduledTask task;
-        private final CancellationContext cancellation = new CancellationContext();
-        private final AtomicReference<RunState> state;
-        private final AtomicBoolean cancellationCallbackSent = new AtomicBoolean(false);
-        private final AtomicBoolean outcomePublished = new AtomicBoolean(false);
-        private final AtomicBoolean executionExitPublished = new AtomicBoolean(false);
-        private final CompletableFuture<Void> startPublished = new CompletableFuture<>();
-        private final CompletableFuture<RunOutcome> completion = new CompletableFuture<>();
-        private volatile Thread runner;
-        private volatile TriggerEntry pendingTrigger;
-        private volatile Instant startedAt;
-
-        private RunControl(ScheduleControl owner, ScheduledTask task, RunState initialState) {
-            this.owner = owner;
-            this.task = task;
-            this.state = new AtomicReference<>(initialState);
-        }
-
-        @Override public UUID id() { return id; }
-        @Override public Optional<UUID> scheduleId() { return owner == null ? Optional.empty() : Optional.of(owner.id()); }
-        @Override public RunState state() { return state.get(); }
 
         @Override
-        public void run() {
-            runner = Thread.currentThread();
-            if (!state.compareAndSet(RunState.QUEUED, RunState.RUNNING)) {
-                runner = null;
-                actualExecutionFinished();
-                return;
-            }
-            try {
-                startedAt = clock.instant();
-                try {
-                    fireStart(owner == null ? null : owner.id(), id);
-                } finally {
-                    startPublished.complete(null);
+        public boolean isAccepting() {
+            return UnifiedScheduler.this.isAccepting();
+        }
+
+        @Override
+        public boolean offerScheduleTrigger(
+                SchedulerSchedule schedule,
+                long generation,
+                Instant instant
+        ) {
+            synchronized (lifecycleLock) {
+                if (!accepting.get() || schedule.state() != ScheduleState.ACTIVE) {
+                    return false;
                 }
-                if (state.get() != RunState.RUNNING) {
-                    publishExistingState(null);
-                    return;
-                }
-                task.run(cancellation);
-                publish(cancellation.isCancellationRequested() ? RunState.CANCELLED : RunState.COMPLETED, null);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                publish(RunState.CANCELLED, interrupted);
-            } catch (Throwable failure) {
-                publish(RunState.FAILED, failure);
-            } finally {
-                runner = null;
-                actualExecutionFinished();
+                offerTrigger(SchedulerTrigger.forSchedule(
+                        schedule,
+                        generation,
+                        instant,
+                        nextTriggerSequence()
+                ));
+                return true;
             }
         }
 
         @Override
-        public boolean requestCancellation(String reason) {
-            Objects.requireNonNull(reason, "reason");
-            RunState current = state.get();
-            if (isTerminal(current)) return false;
-            cancellation.requestCancellation(reason);
-            notifyCancellationCallback();
-            if (state.compareAndSet(RunState.WAITING, RunState.CANCELLED)
-                    || state.compareAndSet(RunState.QUEUED, RunState.CANCELLED)) {
-                TriggerEntry trigger = pendingTrigger;
-                if (trigger != null) triggers.remove(trigger);
-                pendingTrigger = null;
-                executor.remove(this);
-                publishExistingState(null);
-                actualExecutionFinished();
-            }
-            return true;
+        public void removeTrigger(SchedulerTrigger trigger) {
+            UnifiedScheduler.this.removeTrigger(trigger);
         }
 
         @Override
-        public boolean cancel(String reason, Duration grace) throws InterruptedException {
-            Duration validGrace = DelayedSchedule.requireNonNegative(grace, "grace");
-            if (!requestCancellation(reason)) return false;
-            if (state.get() == RunState.RUNNING) {
-                if (runner == Thread.currentThread()) return true;
-                try {
-                    completion.get(validGrace.toNanos(), TimeUnit.NANOSECONDS);
-                } catch (TimeoutException timeout) {
-                    forceCancellation(reason, true);
-                } catch (ExecutionException impossible) {
-                    // Completion always contains RunOutcome rather than completing exceptionally.
-                }
-            }
-            return true;
-        }
-
-        private void forceCancellation(String reason, boolean timedOut) {
-            requestCancellation(reason);
-            RunState terminal = timedOut ? RunState.TIMED_OUT : RunState.CANCELLED;
-            if (state.compareAndSet(RunState.RUNNING, terminal)) {
-                if (runner == Thread.currentThread() && !startPublished.isDone()) return;
-                startPublished.join();
-                publishExistingState(null);
-                Thread currentRunner = runner;
-                if (currentRunner != null) currentRunner.interrupt();
-            }
-        }
-
-        private void cancelBeforeExecution(String reason) {
-            requestCancellation(reason);
-        }
-
-        private void reject(Throwable failure) {
-            RunState current = state.get();
-            if ((current == RunState.QUEUED || current == RunState.WAITING)
-                    && state.compareAndSet(current, RunState.REJECTED)) {
-                publishExistingState(failure);
-                fireRejected(owner == null ? null : owner.id(), id, failure);
-                actualExecutionFinished();
-            }
-        }
-
-        private void notifyCancellationCallback() {
-            if (cancellationCallbackSent.compareAndSet(false, true)) {
-                try { task.onCancellationRequested(); } catch (Throwable ignored) { }
-            }
-        }
-
-        private void publish(RunState terminalState, Throwable failure) {
-            if (state.compareAndSet(RunState.RUNNING, terminalState)) publishExistingState(failure);
-        }
-
-        private void publishExistingState(Throwable failure) {
-            if (!outcomePublished.compareAndSet(false, true)) return;
-            RunOutcome outcome = new RunOutcome(id, state.get(), startedAt, clock.instant(), failure);
-            completion.complete(outcome);
-            if (owner != null) owner.onOutcome(outcome);
-            fireOutcome(owner == null ? null : owner.id(), outcome);
-        }
-
-        private void actualExecutionFinished() {
-            if (!executionExitPublished.compareAndSet(false, true)) return;
-            activeRuns.remove(id, this);
-            if (owner != null) owner.onRunExited(this);
+        public void removeTriggers(SchedulerSchedule schedule) {
+            UnifiedScheduler.this.removeTriggers(schedule);
         }
 
         @Override
-        public RunOutcome await() throws InterruptedException, ExecutionException {
-            return throwIfFailed(completion.get());
+        public void removeQueuedRun(SchedulerRun run) {
+            UnifiedScheduler.this.removeQueuedRun(run);
         }
 
         @Override
-        public RunOutcome await(Duration timeout)
-                throws InterruptedException, ExecutionException, TimeoutException {
-            Duration valid = DelayedSchedule.requireNonNegative(timeout, "timeout");
-            return throwIfFailed(completion.get(valid.toNanos(), TimeUnit.NANOSECONDS));
-        }
-
-        private RunOutcome throwIfFailed(RunOutcome outcome) throws ExecutionException {
-            if (outcome.state() == RunState.FAILED || outcome.state() == RunState.REJECTED) {
-                throw new ExecutionException(outcome.failure().orElse(null));
-            }
-            return outcome;
-        }
-
-        @Override public CompletionStage<RunOutcome> completion() { return completion; }
-    }
-
-    private final class ScheduleControl implements ScheduleHandle {
-        private final UUID id = newIdentifier();
-        private final ScheduledTask task;
-        private final Schedule schedule;
-        private final ScheduleOptions options;
-        private final AtomicReference<ScheduleState> state = new AtomicReference<>(ScheduleState.ACTIVE);
-        private final ConcurrentMap<UUID, RunControl> runs = new ConcurrentHashMap<>();
-        private final AtomicBoolean coalesced = new AtomicBoolean(false);
-        private final AtomicLong generation = new AtomicLong();
-        /** Guards schedule state transitions, trigger registration and run registration. */
-        private final Object transitionLock = new Object();
-        private volatile Instant nextExecution;
-        private volatile RunOutcome lastOutcome;
-
-        private ScheduleControl(ScheduledTask task, Schedule schedule, ScheduleOptions options) {
-            this.task = task; this.schedule = schedule; this.options = options;
-        }
-
-        @Override public UUID id() { return id; }
-        @Override public Schedule schedule() { return schedule; }
-        @Override public ScheduleState state() { return state.get(); }
-        @Override public Optional<Instant> nextExecutionTime() { return Optional.ofNullable(nextExecution); }
-        @Override public Optional<RunOutcome> lastOutcome() { return Optional.ofNullable(lastOutcome); }
-        @Override public List<RunHandle> activeRuns() { return Collections.unmodifiableList(new ArrayList<RunHandle>(runs.values())); }
-
-        private void scheduleInitial() {
-            Instant now = clock.instant();
-            Instant first;
-            if (schedule instanceof ImmediateSchedule) first = now;
-            else if (schedule instanceof DelayedSchedule) first = now.plus(((DelayedSchedule) schedule).delay());
-            else if (schedule instanceof FixedDelaySchedule) first = now.plus(((FixedDelaySchedule) schedule).initialDelay());
-            else if (schedule instanceof FixedRateSchedule) first = now.plus(((FixedRateSchedule) schedule).initialDelay());
-            else if (schedule instanceof CronSchedule) {
-                CronSchedule cron = (CronSchedule) schedule;
-                first = cron.runImmediately() ? now : cron.expression().next(now, cron.zone())
-                        .orElseThrow(() -> new IllegalArgumentException("Cron has no future fire time: " + cron.expression()));
-            } else throw new IllegalArgumentException("Unsupported schedule type: " + schedule.getClass().getName());
-            scheduleAt(first);
-        }
-
-        private void scheduleAt(Instant instant) {
-            synchronized (transitionLock) {
-                synchronized (lifecycleLock) {
-                    if (state.get() != ScheduleState.ACTIVE || !accepting.get()) return;
-                    nextExecution = instant;
-                    TriggerEntry trigger = TriggerEntry.forSchedule(
-                            this, generation.get(), instant, nextSequence());
-                    triggers.offer(trigger);
-                }
-            }
-        }
-
-        private void onTrigger(TriggerEntry trigger) {
-            RunControl run = null;
-            boolean skipped = false;
-            synchronized (transitionLock) {
-                if (state.get() != ScheduleState.ACTIVE || !accepting.get()
-                        || trigger.generation != generation.get()) return;
-                nextExecution = null;
-                boolean occupied = !runs.isEmpty();
-                if (occupied && options.overlapPolicy() == OverlapPolicy.SKIP) {
-                    skipped = true;
-                } else if (occupied && options.overlapPolicy() == OverlapPolicy.COALESCE) {
-                    coalesced.set(true);
-                } else {
-                    run = new RunControl(this, task, RunState.QUEUED);
-                    runs.put(run.id(), run);
-                }
-            }
-            if (skipped) {
-                fireSkipped(id);
-                scheduleNext(trigger.scheduledAt);
-                return;
-            }
-            if (run == null) {
-                scheduleNext(trigger.scheduledAt);
-                return;
-            }
-            submitRun(run, false);
-            scheduleNext(trigger.scheduledAt);
-        }
-
-        private void scheduleNext(Instant previousScheduledAt) {
-            if (state.get() != ScheduleState.ACTIVE) return;
-            Instant now = clock.instant();
-            if (schedule instanceof FixedDelaySchedule) return;
-            if (schedule instanceof FixedRateSchedule) {
-                Instant next = previousScheduledAt.plus(((FixedRateSchedule) schedule).period());
-                if (next.isBefore(now)) {
-                    next = options.misfirePolicy() == MisfirePolicy.FIRE_ONCE_NOW
-                            ? now : now.plus(((FixedRateSchedule) schedule).period());
-                }
-                scheduleAt(next);
-            } else if (schedule instanceof CronSchedule) {
-                CronSchedule cron = (CronSchedule) schedule;
-                Instant base = previousScheduledAt.isBefore(now)
-                        && options.misfirePolicy() == MisfirePolicy.SKIP ? now : previousScheduledAt;
-                Instant next = cron.expression().next(base, cron.zone()).orElse(null);
-                if (next != null) scheduleAt(next);
-            }
-        }
-
-        private void onOutcome(RunOutcome outcome) {
-            synchronized (transitionLock) {
-                lastOutcome = outcome;
-            }
-            if (outcome.state() == RunState.FAILED) {
-                if (options.failurePolicy() == FailurePolicy.PAUSE_SCHEDULE) pause();
-                else if (options.failurePolicy() == FailurePolicy.CANCEL_SCHEDULE) cancel();
-            }
-        }
-
-        private void onRunExited(RunControl run) {
-            synchronized (transitionLock) {
-                runs.remove(run.id(), run);
-                if (state.get() != ScheduleState.ACTIVE) return;
-                if (schedule instanceof ImmediateSchedule || schedule instanceof DelayedSchedule) {
-                    state.compareAndSet(ScheduleState.ACTIVE, ScheduleState.COMPLETED);
-                    schedules.remove(id, this);
-                } else if (schedule instanceof FixedDelaySchedule) {
-                    scheduleAt(clock.instant().plus(((FixedDelaySchedule) schedule).delay()));
-                } else if (coalesced.compareAndSet(true, false)) {
-                    scheduleAt(clock.instant());
-                }
-            }
+        public void removeSchedule(UUID id, SchedulerSchedule schedule) {
+            UnifiedScheduler.this.removeSchedule(id, schedule);
         }
 
         @Override
-        public boolean pause() {
-            synchronized (transitionLock) {
-                if (!state.compareAndSet(ScheduleState.ACTIVE, ScheduleState.PAUSED)) return false;
-                generation.incrementAndGet(); removePendingTriggers(); nextExecution = null; return true;
-            }
+        public void onRunExited(SchedulerRun run) {
+            UnifiedScheduler.this.onRunExited(run);
         }
 
         @Override
-        public boolean resume() {
-            synchronized (transitionLock) {
-                if (!accepting.get()
-                        || !state.compareAndSet(ScheduleState.PAUSED, ScheduleState.ACTIVE)) return false;
-                generation.incrementAndGet(); scheduleInitial(); return true;
-            }
-        }
-
-        @Override public boolean cancel() {
-            try { return cancel(options.cancellationGrace()); }
-            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return true; }
+        public void submitRun(SchedulerRun run, boolean propagateRejection) {
+            UnifiedScheduler.this.submitRun(run, propagateRejection);
         }
 
         @Override
-        public boolean cancel(Duration grace) throws InterruptedException {
-            List<RunControl> runsToStop;
-            synchronized (transitionLock) {
-                ScheduleState previous = state.getAndSet(ScheduleState.CANCELLED);
-                if (previous == ScheduleState.CANCELLED || previous == ScheduleState.COMPLETED) return false;
-                generation.incrementAndGet(); removePendingTriggers(); nextExecution = null;
-                schedules.remove(id, this);
-                runsToStop = new ArrayList<>(runs.values());
-            }
-            stopRuns(runsToStop, grace);
-            return true;
+        public void fireStart(UUID scheduleId, UUID runId) {
+            UnifiedScheduler.this.fireStart(scheduleId, runId);
         }
 
         @Override
-        public boolean stopActiveRuns(Duration grace) throws InterruptedException {
-            List<RunControl> runsToStop;
-            synchronized (transitionLock) {
-                runsToStop = new ArrayList<>(runs.values());
-            }
-            return stopRuns(runsToStop, grace);
+        public void fireOutcome(UUID scheduleId, RunOutcome outcome) {
+            UnifiedScheduler.this.fireOutcome(scheduleId, outcome);
         }
 
-        private void cancelFutureTriggers() {
-            synchronized (transitionLock) {
-                ScheduleState current = state.get();
-                if (current == ScheduleState.ACTIVE || current == ScheduleState.PAUSED) {
-                    state.set(ScheduleState.CANCELLED);
-                }
-                generation.incrementAndGet(); removePendingTriggers(); nextExecution = null;
-                schedules.remove(id, this);
-            }
+        @Override
+        public void fireRejected(UUID scheduleId, UUID runId, Throwable failure) {
+            UnifiedScheduler.this.fireRejected(scheduleId, runId, failure);
         }
 
-        private boolean stopRuns(List<RunControl> runsToStop, Duration grace)
-                throws InterruptedException {
-            boolean changed = false;
-            for (RunControl run : runsToStop) {
-                changed |= run.cancel("Schedule stop requested", grace);
-            }
-            return changed;
-        }
-
-        private void removePendingTriggers() {
-            triggers.removeIf(trigger -> trigger.schedule == this);
+        @Override
+        public void fireSkipped(UUID scheduleId) {
+            UnifiedScheduler.this.fireSkipped(scheduleId);
         }
     }
 
-    private static boolean isTerminal(RunState state) {
-        return state == RunState.COMPLETED || state == RunState.FAILED || state == RunState.CANCELLED
-                || state == RunState.TIMED_OUT || state == RunState.REJECTED || state == RunState.SKIPPED;
-    }
-
-    private static final class TriggerEntry implements Delayed {
-        private final RunControl run;
-        private final ScheduleControl schedule;
-        private final long generation;
-        private final Instant scheduledAt;
-        private final long triggerAtMillis;
-        private final long sequence;
-
-        private TriggerEntry(RunControl run, ScheduleControl schedule, long generation,
-                             Instant scheduledAt, long sequence) {
-            this.run = run; this.schedule = schedule; this.generation = generation;
-            this.scheduledAt = scheduledAt; this.triggerAtMillis = scheduledAt.toEpochMilli();
-            this.sequence = sequence;
-        }
-
-        static TriggerEntry forRun(RunControl run, Instant at, long sequence) {
-            return new TriggerEntry(run, null, 0L, at, sequence);
-        }
-        static TriggerEntry forSchedule(ScheduleControl schedule, long generation, Instant at, long sequence) {
-            return new TriggerEntry(null, schedule, generation, at, sequence);
-        }
-        @Override public long getDelay(TimeUnit unit) {
-            return unit.convert(triggerAtMillis - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
-        }
-        @Override public int compareTo(Delayed other) {
-            TriggerEntry that = (TriggerEntry) other;
-            int byTime = Long.compare(triggerAtMillis, that.triggerAtMillis);
-            return byTime != 0 ? byTime : Long.compare(sequence, that.sequence);
-        }
-    }
-
+    /** Builder for execution, timing, shutdown and listener policies. */
     public static final class Builder {
         private int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
         private int queueCapacity = 10_000;
@@ -755,51 +527,96 @@ public final class UnifiedScheduler implements UnifiedSchedulerInterface {
         private Clock clock = Clock.systemUTC();
         private ShutdownPolicy shutdownPolicy = ShutdownPolicy.defaults();
         private ThreadPoolExecutor executor;
-        private ThreadFactory workerThreadFactory = new NamedThreadFactory("unified-exec", false);
-        private ThreadFactory timerThreadFactory = new NamedThreadFactory("unified-timer", true);
+        private ThreadFactory workerThreadFactory =
+                new SchedulerThreadFactory("unified-exec", false);
+        private ThreadFactory timerThreadFactory =
+                new SchedulerThreadFactory("unified-timer", true);
         private final List<ScheduleEventListener> listeners = new ArrayList<>();
-        private Builder() { }
 
-        public Builder singleThreaded() { parallelism = 1; return this; }
+        private Builder() {
+        }
+
+        public Builder singleThreaded() {
+            parallelism = 1;
+            return this;
+        }
+
         public Builder parallelism(int value) {
-            if (value <= 0) throw new IllegalArgumentException("parallelism must be greater than zero");
-            parallelism = value; return this;
+            if (value <= 0) {
+                throw new IllegalArgumentException("parallelism must be greater than zero");
+            }
+            parallelism = value;
+            return this;
         }
+
         public Builder queueCapacity(int value) {
-            if (value <= 0) throw new IllegalArgumentException("queueCapacity must be greater than zero");
-            queueCapacity = value; return this;
+            if (value <= 0) {
+                throw new IllegalArgumentException("queueCapacity must be greater than zero");
+            }
+            queueCapacity = value;
+            return this;
         }
-        public Builder keepAlive(Duration value) { keepAlive = DelayedSchedule.requireNonNegative(value, "keepAlive"); return this; }
-        public Builder allowCoreThreadTimeout(boolean value) { allowCoreThreadTimeout = value; return this; }
+
+        public Builder keepAlive(Duration value) {
+            keepAlive = DelayedSchedule.requireNonNegative(value, "keepAlive");
+            return this;
+        }
+
+        public Builder allowCoreThreadTimeout(boolean value) {
+            allowCoreThreadTimeout = value;
+            return this;
+        }
+
         public Builder threadNamePrefix(String value) {
-            workerThreadFactory = new NamedThreadFactory(requireName(value), false); return this;
+            workerThreadFactory = new SchedulerThreadFactory(requireName(value), false);
+            return this;
         }
+
         public Builder timerThreadName(String value) {
-            timerThreadFactory = new NamedThreadFactory(requireName(value), true); return this;
+            timerThreadFactory = new SchedulerThreadFactory(requireName(value), true);
+            return this;
         }
-        public Builder threadFactory(ThreadFactory value) { workerThreadFactory = Objects.requireNonNull(value); return this; }
-        public Builder timerThreadFactory(ThreadFactory value) { timerThreadFactory = Objects.requireNonNull(value); return this; }
-        public Builder clock(Clock value) { clock = Objects.requireNonNull(value); return this; }
-        public Builder shutdownPolicy(ShutdownPolicy value) { shutdownPolicy = Objects.requireNonNull(value); return this; }
-        public Builder executor(ThreadPoolExecutor value) { executor = Objects.requireNonNull(value); return this; }
-        public Builder addListener(ScheduleEventListener value) { listeners.add(Objects.requireNonNull(value)); return this; }
-        public UnifiedScheduler build() { return new UnifiedScheduler(this); }
+
+        public Builder threadFactory(ThreadFactory value) {
+            workerThreadFactory = Objects.requireNonNull(value, "threadFactory");
+            return this;
+        }
+
+        public Builder timerThreadFactory(ThreadFactory value) {
+            timerThreadFactory = Objects.requireNonNull(value, "timerThreadFactory");
+            return this;
+        }
+
+        public Builder clock(Clock value) {
+            clock = Objects.requireNonNull(value, "clock");
+            return this;
+        }
+
+        public Builder shutdownPolicy(ShutdownPolicy value) {
+            shutdownPolicy = Objects.requireNonNull(value, "shutdownPolicy");
+            return this;
+        }
+
+        public Builder executor(ThreadPoolExecutor value) {
+            executor = Objects.requireNonNull(value, "executor");
+            return this;
+        }
+
+        public Builder addListener(ScheduleEventListener value) {
+            listeners.add(Objects.requireNonNull(value, "listener"));
+            return this;
+        }
+
+        public UnifiedScheduler build() {
+            return new UnifiedScheduler(this);
+        }
 
         private static String requireName(String value) {
             Objects.requireNonNull(value, "threadName");
-            if (value.isBlank()) throw new IllegalArgumentException("threadName must not be blank");
+            if (value.isBlank()) {
+                throw new IllegalArgumentException("threadName must not be blank");
+            }
             return value;
-        }
-    }
-
-    private static final class NamedThreadFactory implements ThreadFactory {
-        private final String prefix;
-        private final boolean daemon;
-        private final AtomicLong sequence = new AtomicLong();
-        private NamedThreadFactory(String prefix, boolean daemon) { this.prefix = prefix; this.daemon = daemon; }
-        @Override public Thread newThread(Runnable runnable) {
-            Thread thread = new Thread(runnable, prefix + "-" + sequence.incrementAndGet());
-            thread.setDaemon(daemon); return thread;
         }
     }
 }

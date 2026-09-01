@@ -4,6 +4,23 @@
 and cron tasks. Every user task runs on `ThreadPoolExecutor`; a timer dispatcher only transfers
 due triggers into the executor queue.
 
+## Library architecture
+
+The supported public surface is intentionally small: `UnifiedSchedulerInterface`,
+`UnifiedScheduler`, handles, schedule value types, policies, tasks, and listeners. Runtime
+mechanics are separated under `unified.internal.*`, marked internal, and are not extension points:
+
+- `internal.core` defines the private coordination port used by runtime components.
+- `internal.execution` owns run state machines, cancellation, and logical FIFO lanes.
+- `internal.scheduling` owns recurrence, overlap, misfire, and schedule lifecycle.
+- `internal.timing` contains timer-queue entries and never executes user code.
+- `internal.executor` owns `ThreadPoolExecutor` and worker-thread construction policies.
+- `internal.support` contains low-level implementation utilities such as identifiers.
+
+Applications should depend on `UnifiedSchedulerInterface`. `UnifiedScheduler` is the composition
+root. Packages under `unified.internal.*` are implementation details that can evolve without
+compatibility guarantees and must never be imported by consumers.
+
 ## Construction
 
 ```java

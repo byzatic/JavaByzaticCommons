@@ -1,5 +1,7 @@
 package io.github.byzatic.commons.schedulers.unified;
 
+import io.github.byzatic.commons.schedulers.unified.internal.execution.SerialExecutionLane;
+
 import org.junit.Test;
 
 import java.time.Duration;

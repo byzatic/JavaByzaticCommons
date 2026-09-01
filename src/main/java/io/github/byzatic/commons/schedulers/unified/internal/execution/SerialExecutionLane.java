@@ -1,4 +1,9 @@
-package io.github.byzatic.commons.schedulers.unified;
+package io.github.byzatic.commons.schedulers.unified.internal.execution;
+
+import io.github.byzatic.commons.schedulers.unified.ExecutionLane;
+import io.github.byzatic.commons.schedulers.unified.RunHandle;
+import io.github.byzatic.commons.schedulers.unified.UnifiedSchedulerInterface;
+import org.jetbrains.annotations.ApiStatus;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -13,7 +18,8 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 /** Thread-safe FIFO execution lane that borrows its worker from a {@link UnifiedSchedulerInterface}. */
-final class SerialExecutionLane implements ExecutionLane {
+@ApiStatus.Internal
+public final class SerialExecutionLane implements ExecutionLane {
     private final UnifiedSchedulerInterface scheduler;
     private final String name;
     private final Object lock = new Object();
@@ -25,7 +31,7 @@ final class SerialExecutionLane implements ExecutionLane {
     private boolean terminated;
     private RunHandle drainHandle;
 
-    SerialExecutionLane(UnifiedSchedulerInterface scheduler, String name) {
+    public SerialExecutionLane(UnifiedSchedulerInterface scheduler, String name) {
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         this.name = requireName(name);
     }
